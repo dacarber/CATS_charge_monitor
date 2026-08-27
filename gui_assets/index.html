@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LArPix 10x10 Run Control</title>
+  <script>(function(){var t=localStorage.getItem("larpix-theme")||"dark";document.documentElement.setAttribute("data-theme",t);})();</script>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <h1>LArPix 10x10 Run Control
+      <small>flow view &mdash; click a step to run &amp; watch it</small>
+      <span id="theme-slot" style="margin-left:auto"></span>
+    </h1>
+    <div class="descbar">
+      <input type="text" id="descriptor" placeholder="descriptor (run label)">
+      <div class="inline">
+        <label><input type="radio" name="cryo" value="w" checked> Warm</label>
+        <label><input type="radio" name="cryo" value="c"> Cryo</label>
+      </div>
+      <button id="set-descriptor">Set / create descriptor</button>
+      <div class="status" id="desc-status">No descriptor set.</div>
+    </div>
+    <div class="dashlinks">
+      <span style="color:var(--muted);font-size:12px;align-self:center">Dashboards:</span>
+      <a href="/dashboard?stage=self_trigger" target="_blank">Self-trigger rate</a>
+      <a href="/dashboard?stage=convert" target="_blank">Conversion rate</a>
+      <a href="/dashboard?stage=clustering" target="_blank">Clustering rate</a>
+      <a href="/pixelmap" target="_blank">Pixel map</a>
+      <a href="/rundb" target="_blank">Run database</a>
+      <a href="/lifetime" target="_blank">Lifetime vs time</a>
+      <a href="/eventdisplay" target="_blank">Event display</a>
+    </div>
+  </header>
+
+  <div class="legend">
+    <span><span class="swatch running"></span> running (blinking green)</span>
+    <span><span class="swatch done"></span> completed</span>
+    <span><span class="swatch error"></span> crashed</span>
+    <span><span class="badge-hw">HW</span> hardware-exclusive (runs one at a time)</span>
+  </div>
+
+  <div class="flowwrap">
+    <div class="flow" id="flow"></div>
+  </div>
+
+  <script src="/assets/common.js"></script>
+  <script src="/assets/flow.js"></script>
+</body>
+</html>

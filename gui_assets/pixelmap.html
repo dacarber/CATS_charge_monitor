@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LArPix pixel map</title>
+  <script>(function(){var t=localStorage.getItem("larpix-theme")||"dark";document.documentElement.setAttribute("data-theme",t);})();</script>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <h1>
+      <a class="linkbtn" href="/">&larr; Flow</a>
+      Pixel hit-density map
+      <span class="livebadge" id="src-badge">no data</span>
+      <span id="theme-slot" style="margin-left:auto"></span>
+    </h1>
+    <div class="descbar">
+      <div class="status" id="desc-status"></div>
+      <div class="dashlinks" style="margin-top:0">
+        <a href="/dashboard?stage=self_trigger">Self-trigger</a>
+        <a href="/dashboard?stage=convert">Conversion</a>
+        <a href="/dashboard?stage=clustering">Clustering</a>
+        <a href="/rundb">Run database</a>
+        <a href="/lifetime">Lifetime</a>
+        <a href="/eventdisplay">Event display</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="pixwrap">
+    <div class="card pixmap-card">
+      <div class="load-row">
+        <select id="load-kind" title="how to read the file(s)">
+          <option value="auto">Auto</option>
+          <option value="converted">Converted</option>
+          <option value="raw">Raw</option>
+          <option value="clustered">Clustered</option>
+        </select>
+        <input type="text" id="load-path"
+               placeholder="absolute path to an .h5 file OR a folder of .h5 files">
+        <button id="btn-load">Load</button>
+        <button class="secondary" id="btn-live" style="display:none">↺ Back to current run</button>
+      </div>
+      <div class="load-row" id="folder-row" style="display:none">
+        <span class="hint">In folder</span>
+        <select id="folder-file" title="files in the loaded folder, one at a time"
+                style="flex:1; min-width:220px"></select>
+        <button class="secondary" id="folder-prev" title="previous file">&larr;</button>
+        <button class="secondary" id="folder-next" title="next file">&rarr;</button>
+        <span class="hint" id="folder-pos">-</span>
+      </div>
+      <div class="load-row" id="db-row">
+        <span class="hint">From database</span>
+        <select id="db-run" title="runs recorded in the run database, oldest first"
+                style="flex:1; min-width:220px"></select>
+        <button class="secondary" id="db-prev" title="previous run">&larr;</button>
+        <button class="secondary" id="db-next" title="next run">&rarr;</button>
+        <span class="hint" id="db-pos">-</span>
+      </div>
+      <div class="pixmap-head">
+        <span id="map-file" class="hint">-</span>
+        <span class="spacer" style="margin-left:auto"></span>
+        <span class="hint" id="map-stats">-</span>
+      </div>
+      <div id="map"></div>
+      <div class="scalebar">
+        <span class="hint" id="scale-min">0</span>
+        <div class="scale-gradient" id="scale-gradient"></div>
+        <span class="hint" id="scale-max">max</span>
+        <label class="hint" style="margin-left:14px"><input type="checkbox" id="log-scale" checked> log scale</label>
+        <label class="hint" style="margin-left:14px"><input type="checkbox" id="time-mode"> time-resolved</label>
+        <label class="hint" style="margin-left:14px"><input type="checkbox" id="thresh-mode"> trigger thresholds</label>
+      </div>
+
+      <div id="thresh-controls" style="display:none">
+        <div class="timerow">
+          <span class="hint">Cluster hits</span>
+          <input type="number" id="th-min-hits" value="50" min="1" style="width:66px"
+                 title="keep hits whose cluster has at least this many hits">
+          <span class="hint">&ndash;</span>
+          <input type="number" id="th-max-hits" value="350" min="1" style="width:66px"
+                 title="…and at most this many">
+          <span class="hint" style="margin-left:10px">q&rarr;ke&minus;</span>
+          <input type="number" id="th-q-to-ke" value="0.221" step="0.001" style="width:74px"
+                 title="ADC -> ke- conversion applied to the raw q column">
+          <span class="hint" style="margin-left:10px">bins</span>
+          <input type="number" id="th-bins" value="50" min="4" max="400" style="width:60px"
+                 title="charge histogram bins">
+          <button class="secondary" id="th-apply">Recompute</button>
+        </div>
+        <div class="timerow">
+          <span class="hint">Scale [ke&minus;]</span>
+          <input type="number" id="th-vmin" step="0.1" style="width:74px" title="color scale minimum">
+          <span class="hint">&ndash;</span>
+          <input type="number" id="th-vmax" step="0.1" style="width:74px" title="color scale maximum">
+          <button class="secondary" id="th-auto" title="back to the 5th–95th percentile of the data">Auto</button>
+          <span class="hint" id="th-status" style="margin-left:10px">-</span>
+        </div>
+        <div class="hint" id="th-warn" style="color:var(--warn)"></div>
+      </div>
+
+      <div id="time-controls" style="display:none">
+        <div class="timerow">
+          <button class="secondary" id="time-play">▶</button>
+          <input type="range" id="time-slider" min="0" max="0" value="0" style="flex:1">
+          <span class="hint" id="time-label" style="min-width:150px">-</span>
+        </div>
+        <div class="timerow">
+          <label class="hint"><input type="checkbox" id="time-cumulative" checked> cumulative</label>
+          <label class="hint" id="time-width-wrap" style="display:none">window ±<input type="number" id="time-width" value="1" min="1" style="width:52px"> bins</label>
+          <span class="hint" id="time-warn" style="color:var(--warn)"></span>
+        </div>
+        <div id="time-strip"></div>
+      </div>
+
+      <div class="histhead">
+        <span class="hint" id="hist-title"><b>Hit-count distribution</b> &mdash; number of pixels per hits-per-pixel bin</span>
+        <label class="hint" style="margin-left:auto"><input type="checkbox" id="hist-log" checked> log y</label>
+      </div>
+      <div id="hist"></div>
+      <div class="hint" id="hist-note"></div>
+    </div>
+
+    <aside class="card pixpanel">
+      <h3>Pixel selection
+        <span class="hint" id="sel-count" style="font-weight:400"></span>
+      </h3>
+      <div id="pix-info" class="hint">Click a pixel, or <b>drag a box</b> to
+        select a group. Shift+click/drag adds to the selection.</div>
+      <div id="pix-detail" style="display:none">
+        <div class="run-row" style="margin:0 0 8px">
+          <button class="secondary" id="btn-clear">Clear selection</button>
+        </div>
+        <table class="kv">
+          <tr><td>ID (chip-channel)</td><td id="pd-id">-</td></tr>
+          <tr><td>x position</td><td id="pd-x">-</td></tr>
+          <tr><td>y position</td><td id="pd-y">-</td></tr>
+          <tr><td>Hits</td><td id="pd-hits">-</td></tr>
+          <tr><td>Hit density</td><td id="pd-dens">-</td></tr>
+          <tr id="pd-thresh-row" style="display:none"><td>Trigger threshold</td><td id="pd-thresh">-</td></tr>
+          <tr><td>Trim DAC</td><td id="pd-trim">-</td></tr>
+          <tr><td>csa_enable</td><td id="pd-csa">-</td></tr>
+        </table>
+
+        <div id="spectrum-wrap" style="display:none">
+          <div class="hint" style="margin-top:6px"><b>Charge spectrum</b>
+            &mdash; dashed line = 50% rising edge</div>
+          <div id="pix-spectrum"></div>
+          <div class="hint" id="spectrum-note"></div>
+        </div>
+
+        <label class="field">ASIC config folder (for reading &amp; applying changes)</label>
+        <select id="sel-asic-folder"></select>
+
+        <div class="run-row" style="flex-wrap:wrap">
+          <button class="secondary" id="btn-down">&minus;1 threshold</button>
+          <button class="secondary" id="btn-up">+1 threshold</button>
+          <input type="number" id="custom-shift" value="-1" style="width:70px" title="custom shift">
+          <button class="secondary" id="btn-custom">Queue shift</button>
+        </div>
+        <div class="run-row">
+          <button class="danger" id="btn-disable">Disable selected (trim&rarr;31 + csa off)</button>
+        </div>
+        <div class="hint">Actions apply to <b>every selected pixel</b>.</div>
+      </div>
+
+      <h3 style="margin-top:18px">Hot pixels (<span id="hot-count">0</span>)</h3>
+      <div class="hint" id="hot-target">-</div>
+      <div class="run-row" id="hot-actions" style="flex-wrap:wrap">
+        <button class="danger" id="btn-hot">Mark selected hot</button>
+        <button class="secondary" id="btn-unhot">Unmark selected</button>
+        <button class="secondary" id="btn-clear-hot">Clear all hot</button>
+      </div>
+      <div class="hint" id="hot-note" style="display:none"></div>
+      <button id="btn-add-db" style="display:none; margin-top:6px">Add this file to run database</button>
+
+      <h3 style="margin-top:18px">Queued changes (<span id="q-count">0</span>)</h3>
+      <div class="hint">Applied automatically between run files; the run then
+        restarts with the updated configs.</div>
+      <div id="queue-list" class="queue-list"></div>
+      <div class="run-row">
+        <button id="btn-apply">Apply now (no run active)</button>
+      </div>
+      <div id="apply-log" class="hint" style="white-space:pre-wrap"></div>
+    </aside>
+  </div>
+
+  <script src="/assets/common.js"></script>
+  <script src="/assets/pixelmap.js"></script>
+</body>
+</html>

@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Run database</title>
+  <script>(function(){var t=localStorage.getItem("larpix-theme")||"dark";document.documentElement.setAttribute("data-theme",t);})();</script>
+  <link rel="stylesheet" href="/assets/style.css">
+  <style>
+    .wrap { max-width: 1250px; margin: 0 auto; padding: 16px 20px; }
+    table.rundb { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    .rundb th, .rundb td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .rundb th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+    .rundb td.mono { font-family: var(--mono); font-size: 11.5px; }
+    .ok { color: var(--ok); font-weight: 700; }
+    .miss { color: var(--muted); }
+    .rundb textarea {
+      width: 100%; min-width: 180px; min-height: 34px; resize: vertical;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px;
+      font-size: 12px; font-family: inherit;
+    }
+    .rundb input.hv {
+      width: 90px; background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font-size: 12px;
+    }
+    .savebtn { padding: 4px 10px; font-size: 11px; margin-top: 4px; }
+    .empty { color: var(--muted); padding: 40px; text-align: center; }
+    .addrow { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+    .addrow input[type=text] { flex: 1; min-width: 260px; background: var(--panel-2);
+      color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font-size: 13px; }
+    .addrow select { width: 110px; background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; padding: 7px; font-size: 13px; }
+    .hotcell { color: var(--err); font-weight: 700; }
+    .delbtn { background: none; border: 1px solid var(--border); color: var(--err);
+      border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
+    .delbtn:hover { border-color: var(--err); }
+    .manual-tag { font-size: 10px; color: var(--muted); border: 1px solid var(--border);
+      border-radius: 4px; padding: 0 4px; margin-left: 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>
+      <a class="linkbtn" href="/">&larr; Flow</a>
+      Self-trigger run database
+      <span id="theme-slot" style="margin-left:auto"></span>
+    </h1>
+    <div class="descbar">
+      <div class="status" id="sub"></div>
+      <div class="dashlinks" style="margin-top:0">
+        <a href="/dashboard?stage=self_trigger">Self-trigger</a>
+        <a href="/dashboard?stage=convert">Conversion</a>
+        <a href="/dashboard?stage=clustering">Clustering</a>
+        <a href="/pixelmap">Pixel map</a>
+        <a href="/lifetime">Lifetime</a>
+        <a href="/eventdisplay">Event display</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="addrow">
+        <select id="add-kind" title="how to read the file(s)">
+          <option value="auto">Auto</option>
+          <option value="converted">Converted</option>
+          <option value="raw">Raw</option>
+        </select>
+        <input type="text" id="add-path"
+               placeholder="absolute path to an .h5 file OR a folder of .h5 files to add">
+        <button id="btn-add">Add to database</button>
+      </div>
+      <div id="table"></div>
+    </div>
+  </div>
+
+  <script src="/assets/common.js"></script>
+  <script>
+    mountThemeToggle(document.getElementById("theme-slot"));
+    let editing = false;   // pause refresh while a notes/hv field is focused
+    let loaded = false;
+    document.getElementById("table").innerHTML = loadingHTML("Loading run database…");
+    document.getElementById("sub").innerHTML =
+      '<span class="muted">' + SPINNER_SVG + ' Loading…</span>';
+
+    function fmtRate(v) {
+      return v == null ? "—" : (+v).toLocaleString() + " Hz";
+    }
+    function fileCell(name) {
+      return name
+        ? '<span class="ok" title="' + name + '">✓</span> <span class="mono">' + name + "</span>"
+        : '<span class="miss">—</span>';
+    }
+
+    async function refresh(force) {
+      if (editing && !force) return;
+      let data;
+      try {
+        const res = await fetch("/api/runs");
+        data = await res.json();
+      } catch (e) {
+        if (!loaded) document.getElementById("table").innerHTML =
+          loadingHTML("Waiting for the server…");
+        return;
+      }
+      loaded = true;
+
+      document.getElementById("sub").innerHTML = data.descriptor
+        ? "Descriptor: <b>" + data.descriptor + "</b> &nbsp; " + (data.rows || []).length + " runs"
+        : '<span style="color:var(--err)">No descriptor set — open the flow page first.</span>';
+
+      const rows = data.rows || [];
+      if (!rows.length) {
+        document.getElementById("table").innerHTML =
+          '<div class="empty">No runs recorded yet. Rows appear automatically as ' +
+          'self-trigger run files complete, or add files manually above.</div>';
+        return;
+      }
+      let h = '<table class="rundb"><thead><tr>' +
+        "<th>#</th><th>Time</th><th>Raw file</th><th>Converted</th><th>Clustered</th>" +
+        "<th>HV</th><th>Run time</th><th>Messages</th><th>Avg rate</th>" +
+        "<th title='pixels tagged hot on the pixel map'>Hot px</th>" +
+        "<th style='min-width:200px'>Notes</th><th></th>" +
+        "</tr></thead><tbody>";
+      rows.forEach((r) => {
+        const hot = r.hot_pixels || [];
+        const hotCell = hot.length
+          ? '<span class="hotcell" title="' + hot.join(", ") + '">' + hot.length + "</span>"
+          : '<span class="miss">—</span>';
+        const manualTag = r.manual ? '<span class="manual-tag">manual</span>' : "";
+        h += "<tr>" +
+          "<td>" + r.id + "</td>" +
+          "<td>" + (r.ts || "—").replace("T", "<br>") + "</td>" +
+          '<td class="mono">' + (r.raw_file || "—") + manualTag + "</td>" +
+          "<td>" + fileCell(r.converted_file) + "</td>" +
+          "<td>" + fileCell(r.clustered_file) + "</td>" +
+          '<td><input class="hv" data-id="' + r.id + '" value="' + (r.hv || "") + '"></td>' +
+          "<td>" + (r.runtime_s != null ? r.runtime_s + " s" : "—") + "</td>" +
+          "<td>" + (r.messages != null ? (+r.messages).toLocaleString() : "—") + "</td>" +
+          "<td>" + fmtRate(r.avg_rate) + "</td>" +
+          "<td>" + hotCell + "</td>" +
+          '<td><textarea data-id="' + r.id + '">' + (r.notes || "") + "</textarea>" +
+          '<br><button class="savebtn" data-id="' + r.id + '">Save</button></td>' +
+          '<td><button class="delbtn" data-id="' + r.id + '" title="delete row">✕</button></td>' +
+          "</tr>";
+      });
+      h += "</tbody></table>";
+      document.getElementById("table").innerHTML = h;
+
+      document.querySelectorAll(".delbtn").forEach((btn) => {
+        btn.onclick = async () => {
+          const id = +btn.dataset.id;
+          if (!confirm("Delete run row #" + id + " from the database?")) return;
+          try {
+            await postJSON("/api/runs/delete", { id });
+            toast("Deleted row #" + id);
+            refresh(true);
+          } catch (e) { toast(e.message); }
+        };
+      });
+
+      document.querySelectorAll(".rundb textarea, .rundb input.hv").forEach((el) => {
+        el.addEventListener("focus", () => { editing = true; });
+        el.addEventListener("blur", () => { setTimeout(() => { editing = false; }, 200); });
+      });
+      document.querySelectorAll(".savebtn").forEach((btn) => {
+        btn.onclick = async () => {
+          const id = +btn.dataset.id;
+          const notes = document.querySelector('.rundb textarea[data-id="' + id + '"]').value;
+          const hv = document.querySelector('.rundb input.hv[data-id="' + id + '"]').value;
+          await withBusy(btn, "Saving…", async () => {
+            try {
+              await postJSON("/api/runs/update", { id, notes, hv });
+              toast("Saved run #" + id);
+              editing = false;
+              await refresh(true);
+            } catch (e) { toast(e.message); }
+          });
+        };
+      });
+    }
+
+    document.getElementById("btn-add").onclick = async () => {
+      const p = document.getElementById("add-path").value.trim();
+      if (!p) { toast("Enter a file or folder path"); return; }
+      await withBusy(document.getElementById("btn-add"), "Adding…", async () => {
+        try {
+          const r = await postJSON("/api/runs/add",
+            { path: p, kind: document.getElementById("add-kind").value });
+          let msg = "Added " + r.added + ", skipped " + r.skipped;
+          if (r.errors && r.errors.length) msg += " — " + r.errors[0];
+          toast(msg);
+          document.getElementById("add-path").value = "";
+          await refresh(true);
+        } catch (e) { toast(e.message); }
+      });
+    };
+    document.getElementById("add-path").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("btn-add").click();
+    });
+
+    refresh(true);
+    setInterval(() => refresh(false), 5000);
+  </script>
+</body>
+</html>

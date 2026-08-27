@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LArPix data-rate dashboard</title>
+  <script>(function(){var t=localStorage.getItem("larpix-theme")||"dark";document.documentElement.setAttribute("data-theme",t);})();</script>
+  <link rel="stylesheet" href="/assets/style.css">
+  <style>
+    .wrap { max-width: 1000px; margin: 0 auto; padding: 16px 20px; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; }
+    .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .kpi .v { font-size: 24px; font-weight: 700; color: var(--accent); }
+    .kpi .l { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .chartcard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-top: 14px; }
+    .chartcard h3 { margin: 0 0 8px; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 14px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    .muted { color: var(--muted); }
+    .empty { color: var(--muted); padding: 30px; text-align:center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">Dashboard <span id="theme-slot" style="margin-left:auto"></span></h1>
+    <div class="descbar">
+      <div class="status" id="sub"></div>
+      <div class="dashlinks" style="margin-top:0">
+        <a href="/dashboard?stage=self_trigger">Self-trigger</a>
+        <a href="/dashboard?stage=convert">Conversion</a>
+        <a href="/dashboard?stage=clustering">Clustering</a>
+        <a href="/pixelmap">Pixel map</a>
+        <a href="/rundb">Run database</a>
+        <a href="/lifetime">Lifetime</a>
+        <a href="/eventdisplay">Event display</a>
+        <a href="/">&larr; Control panel</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="kpis" id="kpis"></div>
+
+    <div class="chartcard">
+      <h3 id="line-title">Event rate over runs</h3>
+      <div id="line"></div>
+    </div>
+
+    <div class="chartcard">
+      <h3 id="bar-title">Counts per file</h3>
+      <div id="bar"></div>
+    </div>
+
+    <div class="chartcard">
+      <h3>Recent files</h3>
+      <div id="table"></div>
+    </div>
+  </div>
+
+  <script src="/assets/common.js"></script>
+  <script src="/assets/charts.js"></script>
+  <script>
+    mountThemeToggle(document.getElementById("theme-slot"));
+    document.addEventListener("themechange", () => refresh());
+    const accent = () => getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#4f9dff";
+    const accent2 = () => getComputedStyle(document.documentElement).getPropertyValue("--accent-2").trim() || "#2ea043";
+    const STAGES = {
+      self_trigger: { title: "Self-trigger run — data rate",
+        rateLabel: "Messages / sec (Hz)", countLabel: "messages" },
+      convert: { title: "File conversion — data rate",
+        rateLabel: "Packets / sec", countLabel: "packets" },
+      clustering: { title: "Charge clustering — data rate",
+        rateLabel: "Clusters / sec", countLabel: "clusters" },
+    };
+    const params = new URLSearchParams(location.search);
+    const stage = params.get("stage") || "self_trigger";
+    const cfg = STAGES[stage] || STAGES.self_trigger;
+    document.title = cfg.title;
+    document.getElementById("title").textContent = cfg.title;
+
+    function num(v) { const n = parseFloat(v); return isNaN(n) ? null : n; }
+    function fmt(v) { return v == null ? "—" : (Math.round(v * 100) / 100).toLocaleString(); }
+
+    function kpi(v, l) {
+      return '<div class="kpi"><div class="v">' + v + '</div><div class="l">' + l + '</div></div>';
+    }
+
+    function shortLabel(row) {
+      const f = (row.file || "").replace(/^(converted_|clustered_)/, "");
+      const m = f.match(/(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})/);
+      if (m) return m[1].slice(5).replace(/_/g, ":").replace(":", "/");
+      return f.slice(0, 10);
+    }
+
+    let loaded = false;
+    document.getElementById("line").innerHTML = loadingHTML("Loading metrics…");
+    document.getElementById("sub").innerHTML =
+      '<span class="muted">' + SPINNER_SVG + ' Loading…</span>';
+
+    async function refresh() {
+      let data;
+      try {
+        const res = await fetch("/api/metrics/" + stage);
+        data = await res.json();
+      } catch (e) {
+        if (!loaded) document.getElementById("line").innerHTML =
+          loadingHTML("Waiting for the server…");
+        return;
+      }
+      loaded = true;
+
+      document.getElementById("sub").innerHTML = data.descriptor
+        ? "Descriptor: <b>" + data.descriptor + "</b>"
+        : '<span class="muted">No descriptor set — open the control panel first.</span>';
+
+      const rows = data.rows || [];
+      const s = data.summary || {};
+      const rateKey = s.rate_key, countKey = s.count_key;
+
+      // KPIs
+      const k = document.getElementById("kpis");
+      let html = "";
+      html += kpi(fmt(s.latest_rate), "Latest " + cfg.rateLabel);
+      html += kpi(fmt(s.mean_rate), "Mean " + cfg.rateLabel);
+      html += kpi(fmt(s.max_rate), "Peak " + cfg.rateLabel);
+      html += kpi((s.n_files || 0), "Files");
+      html += kpi((s.total_count || 0).toLocaleString(), "Total " + cfg.countLabel);
+      k.innerHTML = html;
+
+      if (!rows.length) {
+        document.getElementById("line").innerHTML =
+          '<div class="empty">No data yet. Run a ' + stage.replace("_", "-") +
+          ' job from the control panel.</div>';
+        document.getElementById("bar").innerHTML = "";
+        document.getElementById("table").innerHTML = "";
+        return;
+      }
+
+      // Line chart: rate over files (+ hits/sec for clustering)
+      const series = [{
+        name: cfg.rateLabel, color: accent(),
+        points: rows.map((r) => ({ label: shortLabel(r), y: num(r[rateKey]) })),
+      }];
+      if (stage === "clustering") {
+        series.push({
+          name: "Hits / sec", color: accent2(),
+          points: rows.map((r) => ({ label: shortLabel(r), y: num(r.hits_per_s) })),
+        });
+      }
+      Charts.drawLine(document.getElementById("line"), series, { yLabel: "rate" });
+
+      // Bar chart: counts per file
+      const items = rows.map((r) => ({ label: r.file, value: num(r[countKey]) || 0 }));
+      Charts.drawBars(document.getElementById("bar"), items,
+        { color: accent(), yLabel: cfg.countLabel });
+      document.getElementById("bar-title").textContent =
+        "Counts per file (" + cfg.countLabel + ")";
+
+      // Table (latest 12, newest first)
+      const cols = data.columns || Object.keys(rows[0]);
+      const recent = rows.slice(-12).reverse();
+      let t = "<table><thead><tr>" +
+        cols.map((c) => "<th>" + c + "</th>").join("") + "</tr></thead><tbody>";
+      recent.forEach((r) => {
+        t += "<tr>" + cols.map((c) => "<td>" + (r[c] == null || r[c] === "" ? "—" : r[c]) + "</td>").join("") + "</tr>";
+      });
+      t += "</tbody></table>";
+      document.getElementById("table").innerHTML = t;
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+    window.addEventListener("resize", refresh);
+  </script>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Electron lifetime vs time</title>
+  <script>(function(){var t=localStorage.getItem("larpix-theme")||"dark";document.documentElement.setAttribute("data-theme",t);})();</script>
+  <link rel="stylesheet" href="/assets/style.css">
+  <style>
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 16px 20px; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; }
+    .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .kpi .v { font-size: 22px; font-weight: 700; color: var(--accent); }
+    .kpi .l { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+    .card h3 { margin: 0 0 10px; font-size: 14px; }
+    .ctl { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .ctl .fld { display: flex; flex-direction: column; gap: 3px; }
+    .ctl label { font-size: 12px; color: var(--muted); }
+    .ctl input, .ctl select { width: 120px; }
+    .ctl input#ov-folder { width: 340px; }
+    .complog { font-family: var(--mono); font-size: 11.5px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px; height: 130px; overflow: auto; white-space: pre-wrap; margin-top: 10px; }
+    .empty { color: var(--muted); padding: 30px; text-align: center; }
+    .muted { color: var(--muted); }
+    .legend2 { display: flex; gap: 18px; font-size: 12px; color: var(--muted); margin-top: 6px; flex-wrap: wrap; }
+    .legend2 .sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>
+      <a class="linkbtn" href="/">&larr; Flow</a>
+      Electron lifetime vs time
+      <span id="theme-slot" style="margin-left:auto"></span>
+    </h1>
+    <div class="descbar">
+      <div class="status" id="sub"></div>
+      <div class="dashlinks" style="margin-top:0">
+        <a href="/dashboard?stage=self_trigger">Self-trigger</a>
+        <a href="/dashboard?stage=convert">Conversion</a>
+        <a href="/dashboard?stage=clustering">Clustering</a>
+        <a href="/pixelmap">Pixel map</a>
+        <a href="/rundb">Run database</a>
+        <a href="/eventdisplay">Event display</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <h3>Compute (one point per N anode-cathode tracks &mdash; via quick_purity)</h3>
+      <div class="ctl">
+        <div class="fld"><label>Source</label>
+          <select id="source">
+            <option value="converted">Converted files</option>
+            <option value="raw">Raw files</option>
+          </select></div>
+        <div class="fld"><label>Each point is</label>
+          <select id="group_by" title="what one plotted point represents">
+            <option value="tracks">N AC tracks</option>
+            <option value="file">one run (file)</option>
+          </select></div>
+        <div class="fld"><label id="bin_size-label">AC tracks / point</label>
+          <input type="number" id="bin_size" value="100" min="10">
+          <span class="hint" id="bin_size-note" style="display:none">
+            every point uses <b>all</b> AC tracks in its file</span></div>
+        <div class="fld"><label>E-field [V/cm]</label>
+          <input type="number" id="efield" value="500" step="0.5"></div>
+        <div class="fld"><label>Run length [s] (spread)</label>
+          <input type="number" id="file_seconds" value="0" min="0"
+                 title="spreads one file's tracks across this many seconds on the time axis"></div>
+        <button id="btn-compute">Compute current run</button>
+        <span class="chip" id="comp-status">idle</span>
+      </div>
+      <div class="ctl" style="margin-top:10px">
+        <div class="fld"><label>Overlay folder (absolute path to a folder of .h5 files)</label>
+          <input type="text" id="ov-folder" placeholder="/path/to/other/run/converted_data"></div>
+        <button class="secondary" id="btn-overlay">Compute overlay</button>
+        <button class="secondary" id="btn-overlay-clear">Clear overlay</button>
+      </div>
+      <div class="hint">Same parse &rarr; DBSCAN cluster &rarr; anode-cathode select &rarr;
+        exponential fit as <code>quick_purity</code> &mdash; one fit per group of N
+        tracks, or (in <i>one run (file)</i> mode) one fit per file using every AC
+        track that file has.
+        Click any plotted point to open its <b>3D event display</b> and exclude bad
+        tracks from the measurement.</div>
+      <div class="complog" id="complog" style="display:none"></div>
+    </div>
+
+    <div class="kpis" id="kpis"></div>
+
+    <div class="card">
+      <h3 id="plot-title">Lifetime &tau; vs time</h3>
+      <div id="plot"></div>
+      <div class="hint" style="margin-top:4px; display:flex; align-items:center; gap:10px">
+        <span>scroll = zoom τ (y) &middot; drag = pan &middot; click a point for details
+          &middot; right-click a point to exclude it</span>
+        <button class="secondary" id="btn-reset-zoom"
+                style="font-size:11px; padding:3px 10px; display:none">Reset zoom</button>
+      </div>
+      <div class="legend2" id="legend"></div>
+    </div>
+  </div>
+
+  <!-- point drill-down modal -->
+  <div class="modal-back" id="evd-back" style="display:none">
+    <div class="evd">
+      <div class="evd-head">
+        <div>
+          <div class="evd-title" id="evd-title">Point</div>
+          <div class="evd-sub" id="evd-sub"></div>
+        </div>
+        <div class="evd-tau" id="evd-tau"></div>
+        <button class="secondary" id="evd-close">Close ✕</button>
+      </div>
+
+      <div class="evd-efield">
+        <label>E-field [V/cm]</label>
+        <input type="number" id="evd-ef" step="1" style="width:90px">
+        <span class="muted">or</span>
+        <label>HV</label>
+        <input type="text" id="evd-hv" placeholder="e.g. 15" style="width:80px">
+        <button class="secondary" id="evd-ef-apply">Apply</button>
+        <button class="secondary" id="evd-ef-reset">Reset to default</button>
+        <span class="muted" id="evd-ef-src"></span>
+      </div>
+
+      <div class="evd-tabs">
+        <button class="evd-tab active" data-tab="evd">3D event display</button>
+        <button class="evd-tab" data-tab="fit">Fit</button>
+        <button class="evd-tab" data-tab="dqdx">dQ/dx 2D</button>
+      </div>
+
+      <div class="evd-panes">
+        <div class="evd-pane" data-pane="evd">
+          <div class="evd-body">
+            <div class="evd-canvas-wrap">
+              <canvas id="evd-canvas" width="640" height="560"></canvas>
+              <div class="hint" style="padding:4px 8px">drag = rotate &middot; wheel = zoom &middot;
+                hover a track in the list to highlight it</div>
+            </div>
+            <div class="evd-side">
+              <div class="evd-list-head">
+                <span>Tracks (<span id="evd-ntracks">0</span>)</span>
+                <span class="muted" id="evd-nexcl"></span>
+              </div>
+              <div class="evd-list" id="evd-list"></div>
+            </div>
+          </div>
+        </div>
+        <div class="evd-pane" data-pane="fit" style="display:none">
+          <div id="evd-fit-wrap" class="evd-imgwrap"></div>
+        </div>
+        <div class="evd-pane" data-pane="dqdx" style="display:none">
+          <div id="evd-dqdx-wrap" class="evd-imgwrap"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/assets/common.js"></script>
+  <script src="/assets/lifetime.js"></script>
+</body>
+</html>

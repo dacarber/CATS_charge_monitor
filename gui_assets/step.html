@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Run step</title>
+  <script>(function(){var t=localStorage.getItem("larpix-theme")||"dark";document.documentElement.setAttribute("data-theme",t);})();</script>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <h1>
+      <a class="linkbtn" href="/">&larr; Flow</a>
+      <span id="step-title">Step</span>
+      <span id="theme-slot" style="margin-left:auto"></span>
+    </h1>
+    <div class="descbar">
+      <div class="status" id="desc-status"></div>
+    </div>
+  </header>
+
+  <div class="steppage">
+    <div class="stepgrid">
+      <div class="card">
+        <h3 id="form-title">Parameters</h3>
+        <div id="hwnote"></div>
+        <div id="form"></div>
+        <div class="run-row">
+          <button id="run-btn">Run step</button>
+          <button id="stop-btn" class="danger" disabled>Stop</button>
+          <span class="chip" id="chip">idle</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Live output</h3>
+        <div class="log" id="log"></div>
+        <div class="plots" id="plots"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/assets/common.js"></script>
+  <script src="/assets/step.js"></script>
+</body>
+</html>

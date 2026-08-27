@@ -1,0 +1,17 @@
+# Runtime dependencies for larpix_gui.py / run_larpix_scripts.py and the
+# pipeline scripts they drive. The GUI server itself is stdlib-only; these are
+# what the wrapped scripts (and the metric/h5 reads) need.
+numpy
+h5py
+PyYAML
+fire
+tqdm
+scikit-learn
+scipy
+matplotlib
+pyserial
+bitarray
+pyzmq
+bidict
+networkx
+reportlab

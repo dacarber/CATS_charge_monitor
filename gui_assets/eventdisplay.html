@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Event display</title>
+  <script>(function(){var t=localStorage.getItem("larpix-theme")||"dark";document.documentElement.setAttribute("data-theme",t);})();</script>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <h1>
+      <a class="linkbtn" href="/">&larr; Flow</a>
+      Event display
+      <span class="livebadge" id="src-badge">no data</span>
+      <span id="theme-slot" style="margin-left:auto"></span>
+    </h1>
+    <div class="descbar">
+      <div class="status" id="desc-status"></div>
+      <div class="dashlinks" style="margin-top:0">
+        <a href="/dashboard?stage=self_trigger">Self-trigger</a>
+        <a href="/dashboard?stage=convert">Conversion</a>
+        <a href="/dashboard?stage=clustering">Clustering</a>
+        <a href="/pixelmap">Pixel map</a>
+        <a href="/rundb">Run database</a>
+        <a href="/lifetime">Lifetime</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="evdwrap">
+    <div class="card evd-main">
+      <div class="load-row">
+        <select id="evd-src" title="where the hits come from">
+          <option value="live">Live (current run)</option>
+          <option value="file">File…</option>
+        </select>
+        <select id="evd-kind" title="how to read the file" style="display:none">
+          <option value="auto">Auto</option>
+          <option value="converted">Converted</option>
+          <option value="raw">Raw</option>
+          <option value="clustered">Clustered</option>
+        </select>
+        <input type="text" id="evd-path" placeholder="absolute path to an .h5 file"
+               style="display:none">
+        <button id="evd-load">Load</button>
+        <span class="hint" id="evd-newest"></span>
+      </div>
+
+      <div class="evdrow">
+        <label class="hint">HV
+          <input type="text" id="evd-hv" placeholder="e.g. 15" style="width:70px"></label>
+        <span class="hint">or E-field
+          <input type="number" id="evd-efield" step="1" style="width:80px"> V/cm</span>
+        <button class="secondary" id="evd-apply-field">Apply</button>
+        <span class="hint" id="evd-window">-</span>
+      </div>
+
+      <div class="evdrow">
+        <label class="hint">Group by
+          <select id="evd-mode" title="how hits are split into events">
+            <option value="window">drift-time window</option>
+            <option value="gap">gap &gt; drift time</option>
+            <option value="cluster">file's own clusters</option>
+          </select></label>
+        <label class="hint">min hits/event
+          <input type="number" id="evd-minhits" value="20" min="1" style="width:64px"></label>
+        <label class="hint"><input type="checkbox" id="evd-auto" checked>
+          auto-refresh every
+          <input type="number" id="evd-interval" value="30" min="2" style="width:56px"> s</label>
+        <button class="secondary" id="evd-refresh">Refresh now</button>
+        <span class="hint" id="evd-refreshed"></span>
+      </div>
+
+      <div class="evdrow">
+        <button class="secondary" id="evd-play"
+                title="play through the events automatically">&#9654;</button>
+        <button class="secondary" id="evd-prev">&larr; Prev</button>
+        <input type="range" id="evd-slider" min="0" max="0" value="0" style="flex:1">
+        <button class="secondary" id="evd-next">Next &rarr;</button>
+        <label class="hint" title="seconds each event is shown while playing">
+          <input type="number" id="evd-speed" value="0.6" min="0.1" step="0.1"
+                 style="width:58px"> s/event</label>
+        <label class="hint" title="stay on this event instead of jumping to the newest">
+          <input type="checkbox" id="evd-pin"> pin</label>
+      </div>
+      <div class="hint" id="evd-eventinfo">-</div>
+
+      <div id="evd-view">
+        <canvas id="evd-canvas" width="900" height="620"></canvas>
+      </div>
+      <div class="hint" style="margin-top:2px">drag = rotate &middot; wheel = zoom
+        &middot; double-click = reset view</div>
+
+      <div class="scalebar" style="margin-top:8px">
+        <span class="hint" id="q-min">0</span>
+        <div class="scale-gradient" id="q-gradient"></div>
+        <span class="hint" id="q-max">max</span>
+        <span class="hint" style="margin-left:10px">charge [ADC]</span>
+      </div>
+    </div>
+
+    <aside class="card evd-side-panel">
+      <h3>Event</h3>
+      <table class="kv">
+        <tr><td>Source</td><td id="ei-src">-</td></tr>
+        <tr><td>Event</td><td id="ei-index">-</td></tr>
+        <tr><td>Hits</td><td id="ei-hits">-</td></tr>
+        <tr><td>Time in run</td><td id="ei-t">-</td></tr>
+        <tr><td>Span</td><td id="ei-span">-</td></tr>
+        <tr><td>Total charge</td><td id="ei-q">-</td></tr>
+        <tr><td>Drift window</td><td id="ei-window">-</td></tr>
+        <tr><td>E-field</td><td id="ei-efield">-</td></tr>
+        <tr><td>z from</td><td id="ei-zsrc">-</td></tr>
+      </table>
+
+      <h3 style="margin-top:18px">Events (<span id="ev-count">0</span>)</h3>
+      <div class="hint" id="ev-note">Biggest events first is not applied &mdash;
+        the list is in time order.</div>
+      <div class="evd-list" id="ev-list" style="max-height:320px"></div>
+    </aside>
+  </div>
+
+  <script src="/assets/common.js"></script>
+  <script src="/assets/eventdisplay.js"></script>
+</body>
+</html>
