@@ -908,7 +908,13 @@ async function refreshDensity() {
   // newer request was discarded while the older one was still in flight.
   if (densityFetching) { densityQueued = true; return; }
   densityFetching = true;
-  try { DENSITY = await api(densityUrl()); } catch (e) { return; }
+  try { DENSITY = await api(densityUrl()); }
+  catch (e) {
+    // api() throws on {error}, which is how the server reports a bad/unmounted
+    // path or a missing descriptor -- show that reason instead of leaving the
+    // "Reading …" spinner up forever.
+    DENSITY = { source: "none", error: e.message, counts: {}, total: 0 };
+  }
   finally {
     densityFetching = false;
     if (densityQueued) { densityQueued = false; setTimeout(refreshDensity, 0); }

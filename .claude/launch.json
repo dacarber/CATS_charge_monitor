@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "larpix-gui-audit",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "cd /private/tmp/claude-501/-Users-danielcarber-Documents-Personal-Claude-workspace-CATS-larpix-charge-monitor/68d0a68e-ffae-4517-89b2-e5d65940f414/scratchpad/launch && export PATH=/Users/danielcarber/Documents/Personal/Claude_workspace/CATS/larpix_charge_monitor/.venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 && exec python -u /Users/danielcarber/Documents/Personal/Claude_workspace/CATS/larpix_charge_monitor/larpix_gui.py --no-browser --port 8765"
+      ],
+      "port": 8765
+    }
+  ]
+}

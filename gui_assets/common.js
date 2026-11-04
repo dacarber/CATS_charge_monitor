@@ -88,14 +88,21 @@ async function withBusy(btn, busyText, fn) {
 
 function fillSelect(sel, items, keepValue = true) {
   if (!sel) return;
-  const prev = sel.value;
+  items = items || [];
+  // Pages refresh every few seconds: leave an unchanged list alone so the
+  // user's selection (and scroll position) isn't reset mid-pick.
+  const cur = Array.from(sel.options, (o) => o.value);
+  if (cur.length === items.length && cur.every((v, i) => v === items[i])) return;
+  // all selected values, not sel.value -- that is only the first one of a
+  // <select multiple>
+  const prev = new Set(Array.from(sel.selectedOptions, (o) => o.value));
   sel.innerHTML = "";
-  (items || []).forEach((p) => {
+  items.forEach((p) => {
     const o = document.createElement("option");
     o.value = p; o.textContent = basename(p);
+    if (keepValue && prev.has(p)) o.selected = true;
     sel.appendChild(o);
   });
-  if (keepValue && prev && items && items.includes(prev)) sel.value = prev;
 }
 
 /* ---- step definitions (shared by flow diagram + step page) -------------- */

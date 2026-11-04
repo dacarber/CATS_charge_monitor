@@ -49,6 +49,7 @@ import sqlite3
 import shutil
 import argparse
 import threading
+import traceback
 import subprocess
 import webbrowser
 from pathlib import Path
@@ -150,7 +151,11 @@ NONROUTED_V2A_CHANNELS = [6, 7, 8, 9, 22, 23, 24, 25, 38, 39, 40, 54, 55, 56, 57
 # number the user types into the HV field (whatever units they run the supply in).
 HV_TO_EFIELD = 29.038
 TICK_US = 0.1                  # one LArPix timestamp tick = 0.1 us
-TIMESTAMP_ROLLOVER = 2 ** 32   # the LArPix timestamp counter wraps here
+# The v2 chip timestamp is 31 bits (packet_v2 timestamp_bits = slice(16, 47)),
+# so it wraps every 2**31 ticks ~= 214.7 s. Checked against the PACMAN unix-time
+# packets in a 600 s run: 2**31 + a two-way unwrap (_unwrap_ticks) matches the
+# wall clock to ~0.3 s; 2**32 never detects a wrap (median error ~215 s).
+TIMESTAMP_ROLLOVER = 2 ** 31
 
 
 def _find_repo_root():
@@ -364,7 +369,10 @@ class JobManager:
                 else:
                     job.status = "done"
         except Exception as exc:  # pragma: no cover - defensive
-            job.log("[ERROR] %s" % exc)
+            # str(exc) alone is cryptic for e.g. a missing param ("'hydra_file'")
+            job.log("[ERROR] %s: %s" % (type(exc).__name__, exc))
+            for line in traceback.format_exc().rstrip().splitlines():
+                job.log(line)
             job.status = "error"
         finally:
             job.end_time = time.time()
@@ -1278,7 +1286,8 @@ def file_density():
     except DensityError:
         return None
     base = os.path.basename(path)
-    return {"source": "file", "file": base, "counts": counts, "total": total,
+    return {"source": "file", "file": base, "path": os.path.abspath(path),
+            "counts": counts, "total": total,
             "duration_s": RUNDB.runtime_for_converted(base)}
 
 
@@ -1305,26 +1314,40 @@ def density_payload(path=None, kind="auto"):
 # Time-resolved density: bin hits by reconstructed elapsed time so a slider can
 # scrub the hit-density map through the run(s).
 # ---------------------------------------------------------------------------
-def reconstruct_elapsed_s(ts):
-    """LArPix timestamps in acquisition order -> (monotonic elapsed seconds, ok).
+def _unwrap_ticks(ts):
+    """Undo the 31-bit chip-timestamp rollover for ticks in acquisition order.
 
-    The 32-bit tick counter wraps at 2**32. Self-trigger packets from different
-    chips are interleaved, so a naive "any big backward jump = rollover" badly
-    over-counts. We only count a *true* wrap (previous near the top of the range,
-    current near the bottom) and then enforce monotonicity with a running max, so
-    residual chip-interleave jitter doesn't move the clock backward. ``ok`` is
-    False if the reconstructed span is implausibly large (data too disordered).
+    Two-way unwrap (``np.unwrap`` semantics, written out so old numpy works):
+    a jump of more than half the counter range between consecutive packets is
+    taken as a wrap, in *either* direction. Packets from different chips arrive
+    up to ~20 s out of order around a wrap, so pre- and post-wrap values
+    alternate there; a one-way "previous near the top, next near the bottom"
+    rule counts every alternation as a new wrap (5 wraps for 1 on a real run),
+    while here a late pre-wrap packet just steps back to its own epoch.
+    """
+    ts = np.asarray(ts, dtype="f8")
+    if ts.size < 2:
+        return ts.copy()
+    P = TIMESTAMP_ROLLOVER
+    steps = -np.round(np.diff(ts) / P)
+    return ts + P * np.concatenate(([0.0], np.cumsum(steps)))
+
+
+def reconstruct_elapsed_s(ts):
+    """LArPix timestamps in acquisition order -> (elapsed seconds per hit, ok).
+
+    Each hit keeps its own unwrapped time (see ``_unwrap_ticks``), measured from
+    the earliest hit. Times are deliberately *not* forced monotonic: a running
+    max let one forward-outlier timestamp freeze the clock and blank out a whole
+    minute of a run. ``ok`` is False if the reconstructed span is implausibly
+    large (data too disordered).
     """
     ts = np.asarray(ts, dtype="f8")
     if ts.size == 0:
         return ts, False
-    P = TIMESTAMP_ROLLOVER
-    roll = np.where((ts[:-1] > 0.9 * P) & (ts[1:] < 0.1 * P), 1, 0)
-    corrected = ts.copy()
-    corrected[1:] += np.cumsum(roll) * P
-    corrected = np.maximum.accumulate(corrected)          # ignore backward jitter
-    elapsed = (corrected - corrected[0]) * TICK_US * 1e-6  # ticks -> seconds
-    return elapsed, bool(elapsed[-1] < 6 * 3600)
+    corrected = _unwrap_ticks(ts)
+    elapsed = (corrected - corrected.min()) * TICK_US * 1e-6  # ticks -> seconds
+    return elapsed, bool(elapsed.max() < 6 * 3600)
 
 
 def _timebinned_hits(path, kind):
@@ -1419,7 +1442,7 @@ def _timed_worker(state, files, kind, bins):
         if base is None:                      # cumulative fallback
             base = t_end
         per_file.append((base, chips, chans, elapsed))
-        t_end = max(t_end, base + (float(elapsed[-1]) if elapsed.size else 0.0))
+        t_end = max(t_end, base + (float(elapsed.max()) if elapsed.size else 0.0))
         with state["lock"]:
             state["n_done"] += 1
 
@@ -1838,21 +1861,14 @@ def _evd_key_to_combined(keys):
 def _evd_sorted_times(ts):
     """Rollover-corrected hit times [us], plus the order that sorts them.
 
-    ``reconstruct_elapsed_s`` forces monotonicity, which is right for aggregate
-    binning but wrong here: we need each hit's own time. So we undo the 2**32
-    wrap the same way (a true wrap = previous near the top, current near the
-    bottom) but then *sort* rather than clamp, because self-trigger packets from
-    different chips arrive interleaved.
+    Undoes the 2**31 wrap with ``_unwrap_ticks`` and then *sorts*, because
+    self-trigger packets from different chips arrive interleaved and events are
+    sliced on hit time.
     """
     ts = np.asarray(ts, dtype="f8")
     if ts.size == 0:
         return ts, np.arange(0)
-    P = TIMESTAMP_ROLLOVER
-    roll = np.zeros(ts.size, dtype="i8")
-    if ts.size > 1:
-        wrapped = (ts[:-1] > 0.9 * P) & (ts[1:] < 0.1 * P)
-        roll[1:] = np.cumsum(np.where(wrapped, 1, 0))
-    corrected = ts + roll * P
+    corrected = _unwrap_ticks(ts)
     order = np.argsort(corrected, kind="stable")
     return corrected[order] * TICK_US, order
 
@@ -2299,6 +2315,7 @@ def _apply_pixel_change(folder, entry, log):
         return False
     try:
         # Preferred path: same API the existing threshold menu uses.
+        _larpix_fmt()   # repo / vendored larpix on sys.path if not installed
         from larpix import Configuration_v2
         config = Configuration_v2()
         config.load(f)
@@ -2627,15 +2644,49 @@ class RunDB:
                     if k in (None, "auto"):
                         k = _detect_h5_kind(fp) or (
                             "converted" if base.startswith("converted_") else "raw")
+                    clu = None
                     if k == "converted":
                         raw = base[len("converted_"):] if base.startswith("converted_") else base
                         conv = base
+                    elif k == "clustered":
+                        # GUI clustering writes clustered_converted_<raw>.h5:
+                        # strip the prefixes the way link_clustered() does and
+                        # attach to that run's row, so hot pixels tagged on the
+                        # clustered file land on the run lifetime/evd read.
+                        conv = base[len("clustered_"):] if base.startswith("clustered_") else base
+                        raw = conv[len("converted_"):] if conv.startswith("converted_") else conv
+                        row = conn.execute(
+                            "SELECT id, clustered_file FROM runs "
+                            "WHERE raw_file=? OR converted_file=? "
+                            "ORDER BY id DESC LIMIT 1", (raw, conv)).fetchone()
+                        if row:
+                            if row[1] == base:
+                                skipped += 1
+                            else:
+                                conn.execute("UPDATE runs SET clustered_file=? "
+                                             "WHERE id=?", (base, row[0]))
+                                added += 1          # reported as "linked"
+                            continue
+                        # No run row yet (or another reco chain's naming, e.g.
+                        # datalog_*_clusters.h5): one row keyed on the derived
+                        # run name. converted_file stays empty -- nothing says
+                        # that file exists.
+                        conv, clu = None, base
                     else:
                         raw, conv = base, None
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO runs "
-                        "(ts, raw_file, converted_file, manual) VALUES (?,?,?,1)",
-                        (self._ts_for(fp), raw, conv))
+                        "(ts, raw_file, converted_file, clustered_file, manual) "
+                        "VALUES (?,?,?,?,1)",
+                        (self._ts_for(fp), raw, conv, clu))
+                    if cur.rowcount == 0 and conv:
+                        # the run's row already exists (e.g. created from its
+                        # clustered file first): fill in the converted name
+                        # instead of silently skipping
+                        cur = conn.execute(
+                            "UPDATE runs SET converted_file=? WHERE raw_file=? "
+                            "AND (converted_file IS NULL OR converted_file='')",
+                            (conv, raw))
                     if cur.rowcount > 0:
                         added += 1
                     else:
@@ -2900,13 +2951,25 @@ def op_plot_metrics(job, p):
 def op_clustering(job, p):
     conv_dir = CTX.d("converted_self_trigger")
     clustered_dir = CTX.d("clustered_data")
+    # charge_clustering.py (via input_config.py) opens charge_layout/,
+    # detector_properties/, pedestal/ and config/ relative to its CWD, so it has
+    # to run from charge_reco/ -- the original menu's commented-out
+    # os.chdir(clustering_dir). Same argv; paths are made absolute so they
+    # still resolve from there.
+    clustering_dir = os.path.abspath(CLUSTERING_DIR)
+    script = os.path.join(clustering_dir, "charge_clustering.py")
+    if not os.path.isfile(script):
+        job.log("[ERROR] charge_clustering.py not found at %s" % script)
+        job.had_error = True
+        return
 
     def cluster_one(in_path):
-        out_path = os.path.join(clustered_dir,
-                                "clustered_" + os.path.basename(in_path))
-        command = ["python3", os.path.join(CLUSTERING_DIR, "charge_clustering.py"),
+        in_path = os.path.abspath(in_path)
+        out_path = os.path.abspath(os.path.join(
+            clustered_dir, "clustered_" + os.path.basename(in_path)))
+        command = ["python3", script,
                    "SingleCube", in_path, out_path, "--save_hits=True"]
-        code, wall = run_streamed(job, command)
+        code, wall = run_streamed(job, command, cwd=clustering_dir)
         if code == 0 and os.path.exists(out_path):
             job.log("Clustered file moved to %s" % out_path)
             try:
@@ -3605,6 +3668,7 @@ def op_thresholds(job, p):
         run_streamed(job, command)
         return
 
+    _larpix_fmt()   # puts the repo / vendored larpix on sys.path if not installed
     from larpix import Configuration_v2  # noqa: F401 (import path preserved)
     config = Configuration_v2()
 
@@ -3719,6 +3783,9 @@ HARDWARE_ACTIONS = {
     "check_power", "make_hydra", "trigger_rate", "pedestal",
     "find_thresholds", "self_trigger",
 }
+# Held across the busy-check and JOBS.start() so two near-simultaneous requests
+# (a double-click) can't both see "not busy" and start two hardware jobs.
+HW_START_LOCK = threading.Lock()
 
 ACTION_LABELS = {
     "check_power": "Check power",
@@ -3849,6 +3916,30 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routing ----------------------------------------------------------
     def do_GET(self):
+        self._dispatch(self._route_get)
+
+    def do_POST(self):
+        self._dispatch(self._route_post)
+
+    def _dispatch(self, route):
+        """Run a route; turn any uncaught exception into a JSON 500.
+
+        Without this an exception just drops the connection: the browser sees
+        "Failed to fetch" and the reason only reaches the server console.
+        """
+        try:
+            route()
+        except (BrokenPipeError, ConnectionResetError):
+            pass                              # client went away mid-response
+        except Exception as exc:
+            traceback.print_exc()
+            try:
+                self._send_json({"error": "%s: %s" % (type(exc).__name__, exc)},
+                                500)
+            except Exception:
+                pass
+
+    def _route_get(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -4028,7 +4119,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_file(full, CONTENT_TYPES[".png"])
         return self._send_json({"error": "not found"}, 404)
 
-    def do_POST(self):
+    def _route_post(self):
         parsed = urlparse(self.path)
         path = parsed.path
         body = self._read_json()
@@ -4046,15 +4137,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "unknown action"}, 400)
             if not CTX.is_ready():
                 return self._send_json({"error": "set a descriptor first"}, 400)
-            if action in HARDWARE_ACTIONS:
-                busy = JOBS.running_hardware()
-                if busy:
-                    return self._send_json(
-                        {"error": "Hardware busy: '%s' is running. Hardware steps "
-                                  "run one at a time." % busy[0].name}, 409)
             handler = ACTIONS[action]
             name = ACTION_LABELS.get(action, action)
-            job = JOBS.start(name, partial(_invoke, handler, body), action=action)
+            with HW_START_LOCK:
+                busy = (JOBS.running_hardware()
+                        if action in HARDWARE_ACTIONS else None)
+                if not busy:
+                    job = JOBS.start(name, partial(_invoke, handler, body),
+                                     action=action)
+            if busy:
+                return self._send_json(
+                    {"error": "Hardware busy: '%s' is running. Hardware steps "
+                              "run one at a time." % busy[0].name}, 409)
             return self._send_json({"job_id": job.id})
 
         if path.startswith("/api/job/") and path.endswith("/stop"):
@@ -4263,6 +4357,93 @@ def restore_last_descriptor():
               "flow page." % exc)
 
 
+# Scripts the preserved argvs run, relative to the launch directory.
+PIPELINE_SCRIPTS = [
+    "check_power.py", "map_uart_links_qc.py", "plot_hydra_network_v2a.py",
+    "multi_trigger_rate_qc.py", "pedestal_qc.py", "plot_xy_disabled_channel.py",
+    "threshold_qc.py", "start_run_log_raw.py", "increment_global.py",
+    os.path.join(CONVERTER_DIR, "convert_rawhdf5_to_hdf5.py"),
+    os.path.join("larpix-monitor", "run_monitor.py"),
+    GEOMETRY_YAML,
+]
+
+
+def preflight():
+    """Print a startup checklist of what this machine can and can't run.
+
+    Warnings only -- never blocks startup and never alters a command. The
+    pipeline steps run ``python3`` from PATH with paths relative to the launch
+    directory (the preserved argvs), so on a new machine the usual failures are
+    environmental; this surfaces them before a run instead of in the middle of
+    one.
+    """
+    lines = []
+
+    def report(ok, msg):
+        lines.append(("  ok    " if ok else "  WARN  ") + msg)
+
+    # Dashboards (in-process)
+    missing = []
+    for mod in ("numpy", "h5py", "yaml", "scipy", "sklearn", "matplotlib"):
+        try:
+            __import__(mod)
+        except Exception:
+            missing.append(mod)
+    report(not missing, "GUI imports: " + (
+        "all present" if not missing else "missing %s -- pip install -r "
+        "requirements.txt in this environment" % ", ".join(missing)))
+
+    # The interpreter the pipeline steps get ("python3" on PATH)
+    py3 = shutil.which("python3")
+    if py3 is None:
+        report(False, "'python3' is not on PATH -- every pipeline step will fail")
+    else:
+        probe = ("import sys\nmissing = []\n"
+                 "for m in ('numpy', 'h5py', 'larpix'):\n"
+                 "    try:\n        __import__(m)\n"
+                 "    except Exception:\n        missing.append(m)\n"
+                 "print(sys.prefix)\nprint(','.join(missing))\n")
+        try:
+            out = subprocess.run([py3, "-c", probe], capture_output=True,
+                                 text=True, timeout=30).stdout.splitlines()
+            prefix, py3_missing = out[0], [m for m in out[1].split(",") if m]
+        except Exception as exc:
+            prefix, py3_missing = None, None
+            report(False, "could not run %s (%s)" % (py3, exc))
+        if prefix is not None:
+            # compare environments, not binaries: a venv's python3 is a
+            # symlink to the same base interpreter
+            same_env = os.path.realpath(prefix) == os.path.realpath(sys.prefix)
+            report(same_env, "pipeline python3 = %s%s" % (py3, "" if same_env else
+                   "  (NOT this GUI's environment %s -- activate the venv "
+                   "before launching)" % sys.prefix))
+            report(not py3_missing, "pipeline python3 imports: " + (
+                "numpy, h5py, larpix ok" if not py3_missing else
+                "missing %s -- pipeline scripts will fail" % ", ".join(py3_missing)))
+
+    # Pipeline scripts in the launch directory
+    absent = [s for s in PIPELINE_SCRIPTS if not os.path.exists(s)]
+    if len(absent) == len(PIPELINE_SCRIPTS):
+        report(False, "no pipeline scripts in %s -- offline mode (hardware and "
+               "convert steps unavailable; launch from larpix-10x10-scripts/ "
+               "for those)" % os.getcwd())
+    else:
+        report(not absent, "pipeline scripts in launch dir: " + (
+            "all present" if not absent else "missing " + ", ".join(absent)))
+
+    clu = os.path.join(CLUSTERING_DIR, "charge_clustering.py")
+    report(os.path.isfile(clu), "clustering: " + (
+        os.path.abspath(clu) if os.path.isfile(clu) else
+        "charge_clustering.py not found (looked in %s)"
+        % os.path.abspath(CLUSTERING_DIR)))
+    lt = find_lifetime_script()
+    report(lt is not None, "lifetime: " + (lt or "lifetime_vs_tracks.py not found"))
+
+    print("Preflight:")
+    for line in lines:
+        print(line)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -4271,10 +4452,15 @@ def main():
                         help="do not auto-open a web browser")
     parser.add_argument("--no-restore", action="store_true",
                         help="do not re-activate the last descriptor at startup")
+    parser.add_argument("--no-preflight", action="store_true",
+                        help="skip the startup environment checklist")
     args = parser.parse_args()
 
     if not os.path.isdir(ASSETS_DIR):
         raise SystemExit("Missing assets directory: %s" % ASSETS_DIR)
+
+    if not args.no_preflight:
+        preflight()
 
     if not args.no_restore:
         restore_last_descriptor()

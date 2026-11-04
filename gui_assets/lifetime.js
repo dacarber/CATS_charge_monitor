@@ -365,7 +365,12 @@ async function pollJob() {
   if (!computeJob) return;
   let snap;
   try { snap = await api("/api/job/" + computeJob + "?offset=" + logOffset); }
-  catch (e) { return; }
+  catch (e) {
+    // the server restarted mid-compute: that job is gone, so stop tracking it
+    // and let loadSeries() show the real status again
+    if (/no such job/.test(e.message)) computeJob = null;
+    return;
+  }
   const log = $("complog");
   log.style.display = "";
   if (snap.lines && snap.lines.length) {
