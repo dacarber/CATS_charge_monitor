@@ -45,6 +45,9 @@ import glob
 import json
 import time
 import zlib
+import struct
+import fnmatch
+import filecmp
 import sqlite3
 import shutil
 import argparse
@@ -100,12 +103,17 @@ def settings(setting=None, value=None, settings_file="larpix_script_settings.txt
     dump(settings_file, data)
 
 
-def get_latest_file(pattern, directory="."):
-    """Latest file matching ``pattern`` in ``directory`` + a timestamped new name."""
+def get_latest_file(pattern, directory=".", exclude=None):
+    """Latest file matching ``pattern`` in ``directory`` + a timestamped new name.
+
+    ``exclude`` (GUI-only addition, default off): glob patterns to skip, e.g.
+    ``("*.dqm.h5",)`` so larpix-monitor's temp file never passes for raw data.
+    """
     dir_path = Path(directory)
     if not dir_path.is_dir():
         raise ValueError("Provided path is not a directory: %s" % directory)
-    files = [f for f in dir_path.glob(pattern) if f.is_file()]
+    files = [f for f in dir_path.glob(pattern) if f.is_file()
+             and not any(fnmatch.fnmatch(f.name, x) for x in (exclude or ()))]
     if not files:
         return None, None
     latest_file = max(files, key=lambda f: f.stat().st_ctime)
@@ -247,7 +255,8 @@ class RunContext:
         "logs": "logs",
         "metrics": "metrics",
     }
-    PLOT_SUBDIRS = ["hydra_files", "trigger_rate_disabled", "pedestal_runs"]
+    PLOT_SUBDIRS = ["hydra_files", "trigger_rate_disabled", "pedestal_runs",
+                    "raw_self_trigger"]   # step-11 plots for self-trigger files
 
     def __init__(self):
         self.descriptor = None
@@ -425,6 +434,10 @@ def run_streamed(job, command, cwd=None):
     job.log("$ " + " ".join(command))
     start = time.time()
     try:
+        # PYTHONUNBUFFERED: a child writing to a pipe block-buffers its stdout
+        # (~8 KB), so e.g. start_run_log_raw.py's per-5 s rate line only arrived
+        # when the run ended. Unbuffered output streams like it did in a
+        # terminal. The argv itself is untouched.
         proc = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -432,6 +445,7 @@ def run_streamed(job, command, cwd=None):
             text=True,
             bufsize=1,
             cwd=cwd,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
     except FileNotFoundError as exc:
         job.log("[ERROR] command not found: %s" % exc)
@@ -465,9 +479,9 @@ def run_streamed(job, command, cwd=None):
 # ---------------------------------------------------------------------------
 # Helpers ported from the nested helpers of run_larpix_scripts.py
 # ---------------------------------------------------------------------------
-def move_file(job, pattern, dest_dir, since_time, add_ts=True):
+def move_file(job, pattern, dest_dir, since_time, add_ts=True, exclude=None):
     """Latest file matching ``pattern`` in CWD -> ``dest_dir`` (mirrors original)."""
-    latest_file, new_file = get_latest_file(pattern)
+    latest_file, new_file = get_latest_file(pattern, exclude=exclude)
     if latest_file is None or new_file is None:
         job.log("Looks like no files were made at the previous step...")
         return None
@@ -726,6 +740,16 @@ _LARPIX_FMT = "unset"          # "unset" | None | (rhdf5, pacman_msg_fmt)
 LIVE_LOCK = threading.Lock()
 LIVE_ACC = {}                  # raw path -> {"counts": {...}, "last": int}
 LIVE_CHUNK = 20000             # max messages parsed per poll
+# larpix-monitor (step 11) drops a temp '<input stem>.dqm.h5' into CWD while it
+# runs; for raw input that name contains "raw", so every '*raw*.h5' lookup of
+# the live file (or the post-run move) could otherwise pick it up instead.
+LIVE_RAW_EXCLUDE = ("*.dqm.h5",)
+
+
+def latest_live_raw():
+    """Newest raw file being written in CWD (never step 11's temp file)."""
+    latest, _ = get_latest_file("*raw*.h5", directory=".", exclude=LIVE_RAW_EXCLUDE)
+    return latest
 _FILE_DENSITY_CACHE = {}       # (path, kind) -> (mtime, counts, total)
 _FILE_DENSITY_MAX = 200        # in-memory entries kept (oldest evicted first)
 
@@ -912,7 +936,7 @@ def live_density():
     if fmt is None:
         return None
     rhdf5, pmf = fmt
-    latest, _ = get_latest_file("*raw*.h5", directory=".")
+    latest = latest_live_raw()
     if latest is None:
         return None
     path = str(latest)
@@ -945,6 +969,225 @@ def live_density():
     return {"source": "live", "file": os.path.basename(path),
             "counts": counts, "total": sum(counts.values()),
             "parsed_msgs": parsed, "total_msgs": n}
+
+
+# ---------------------------------------------------------------------------
+# Live self-trigger rate in fixed 5 s bins (tails the raw file being written)
+# ---------------------------------------------------------------------------
+RATE_BIN_S = 5            # bin width, seconds of data time
+RATE_POLL_S = 1.0         # how often the sampler looks for new messages
+RATE_STALL_S = 6.0        # close a bin by host clock if no newer data arrives
+RATE_MAX_MSGS = 50000     # max messages parsed per poll (catches up over polls)
+RATE_5S_COLS = ["wall_time", "file", "bin_start_s", "hits", "messages",
+                "hits_per_s", "partial"]
+LIVE_RATE_LOCK = threading.Lock()
+LIVE_RATE = {}            # snapshot of the file being (or last) sampled
+
+
+def _append_csv(path, cols, row):
+    """Append one row to a CSV under METRICS_LOCK, writing the header once."""
+    with METRICS_LOCK:
+        new = not os.path.exists(path)
+        with open(path, "a", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=cols)
+            if new:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in cols})
+
+
+class RateSampler:
+    """Hits per 5 s for one self-trigger file while start_run_log_raw.py writes it.
+
+    Runs in its own thread for the duration of one ``run_streamed`` call, so the
+    rate is recorded whether or not any page is open. It tails the growing raw
+    file exactly like ``live_density`` (SWMR length, then only the new rows).
+
+    Clock: every PACMAN message starts with a ``'<cLxH'`` header whose ``L`` is
+    a unix second stamped by the PACMAN. Those seconds are monotonic in file
+    order, unlike the 31-bit chip ticks (which roll over every ~214.7 s and
+    arrive interleaved/out of order), so bins are ``(t - t0) // 5`` with ``t0``
+    the file's first message. The PACMAN clock is *not* synced to the host, so
+    wall time comes from the raw file's ``meta.created`` attribute + offset.
+
+    A bin is closed (logged, appended to ``metrics/self_trigger_5s.csv``) once a
+    later message proves it complete, or -- so a silent detector still shows up
+    as zeros -- once the host clock is ``RATE_STALL_S`` past its end.
+    """
+
+    def __init__(self, job, since_time):
+        self.job = job
+        self.since = since_time
+        self.csv_path = (os.path.join(CTX.d("metrics"), "self_trigger_5s.csv")
+                         if CTX.is_ready() else None)
+        self.path = None
+        self.last = 0            # messages parsed so far
+        self.t0 = None           # header second of the first message
+        self.t_max = None        # newest header second seen
+        self.anchor = None       # host unix time matching t0
+        self.bins = {}           # open bins: index -> [hits, messages]
+        self.next_bin = 0        # lowest bin index not yet closed
+        self.late = 0            # messages that arrived after their bin closed
+        self.closed = []         # closed bins (CSV-shaped dicts), this file
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def stop(self):
+        """Final drain + flush. Call after the acquisition process has exited."""
+        self.stop_event.set()
+        self.thread.join(timeout=60)
+
+    # -- internals ---------------------------------------------------------
+    def _loop(self):
+        fmt = _larpix_fmt()
+        if fmt is None:
+            self.job.log("[rate] larpix-control not importable -- no live 5 s rate")
+            return
+        try:
+            while not self.stop_event.wait(RATE_POLL_S):
+                self._poll(fmt)
+            for _ in range(1000):          # the file is complete now: drain it
+                if not self._poll(fmt):
+                    break
+            self._close_bins(final=True)
+            self._summary()
+        except Exception as exc:           # never take the run down with us
+            self.job.log("[rate] [WARN] live rate stopped: %s" % exc)
+        finally:
+            self._publish(running=False)
+
+    def _find_file(self):
+        latest = latest_live_raw()
+        # ctime >= run start: never pick up a stale raw file left in CWD
+        if latest is None or latest.stat().st_ctime < self.since - 1:
+            return False
+        self.path = str(latest)
+        try:
+            with open_h5_read(self.path) as f:
+                self.anchor = float(f["meta"].attrs["created"])
+        except Exception:
+            self.anchor = None             # fall back to first-sighting time
+        return True
+
+    def _poll(self, fmt):
+        """Parse any new messages; True if more remain beyond this chunk."""
+        rhdf5, pmf = fmt
+        if self.path is None and not self._find_file():
+            return False
+        try:
+            n = rhdf5.len_rawfile(self.path, attempts=0)
+        except Exception:
+            return False
+        more = False
+        if n > self.last:
+            end = min(n, self.last + RATE_MAX_MSGS)
+            try:
+                rd = rhdf5.from_rawfile(self.path, start=self.last, end=end)
+            except Exception:
+                return False               # mid-write; retry next poll
+            for iog, msg in zip(rd["msg_headers"]["io_groups"], rd["msgs"]):
+                try:
+                    t = int(pmf.msg_header_struct.unpack_from(msg)[1])
+                except (struct.error, TypeError):
+                    continue
+                hits = 0
+                for pkt in pmf.parse(msg, io_group=iog):
+                    if getattr(pkt, "packet_type", None) == 0:
+                        hits += 1
+                if self.t0 is None:
+                    self.t0 = t
+                    if self.anchor is None:
+                        self.anchor = time.time()
+                b = (t - self.t0) // RATE_BIN_S
+                if b < self.next_bin:      # its bin already closed by the clock
+                    b = self.next_bin
+                    self.late += 1
+                acc = self.bins.setdefault(b, [0, 0])
+                acc[0] += hits
+                acc[1] += 1
+                self.t_max = t if self.t_max is None else max(self.t_max, t)
+            self.last = end
+            more = end < n
+        self._close_bins()
+        self._publish(running=True)
+        return more
+
+    def _close_bins(self, final=False):
+        if self.t0 is None:
+            return
+        now = time.time()
+        while True:
+            b = self.next_bin
+            b_end = self.t0 + (b + 1) * RATE_BIN_S   # first second of next bin
+            by_data = self.t_max is not None and self.t_max >= b_end
+            by_clock = (self.anchor is not None and
+                        now >= self.anchor + (b + 1) * RATE_BIN_S + RATE_STALL_S)
+            if final:
+                if not self.bins or b > max(self.bins):
+                    break
+            elif not (by_data or by_clock):
+                break
+            hits, msgs = self.bins.pop(b, [0, 0])
+            covered = RATE_BIN_S
+            if final and not by_data:      # the run's last bin: up to t_max only
+                covered = max(1, min(RATE_BIN_S,
+                                     self.t_max - (self.t0 + b * RATE_BIN_S) + 1))
+            self._emit(b, hits, msgs, covered)
+            self.next_bin += 1
+
+    def _emit(self, b, hits, msgs, covered):
+        start_s = b * RATE_BIN_S
+        rate = hits / float(covered)
+        partial = covered < RATE_BIN_S
+        wall = (datetime.fromtimestamp(self.anchor + start_s)
+                .isoformat(timespec="seconds") if self.anchor else "")
+        row = {"wall_time": wall, "file": os.path.basename(self.path),
+               "bin_start_s": start_s, "hits": hits, "messages": msgs,
+               "hits_per_s": round(rate, 3), "partial": int(partial),
+               "covered_s": covered}              # not a CSV column
+        self.closed.append(row)
+        self.job.log("[rate] +%02d:%02d  %s hits / %d s = %.1f Hz  (msgs %d)%s"
+                     % (start_s // 60, start_s % 60, format(hits, ","), covered,
+                        rate, msgs, "  [partial bin]" if partial else ""))
+        if self.csv_path:
+            try:
+                _append_csv(self.csv_path, RATE_5S_COLS, row)
+            except OSError as exc:
+                self.job.log("[rate] [WARN] could not write %s: %s"
+                             % (self.csv_path, exc))
+
+    def _summary(self):
+        if not self.closed:
+            self.job.log("[rate] no data messages seen in the raw file")
+            return
+        hits = sum(r["hits"] for r in self.closed)
+        span = sum(r["covered_s"] for r in self.closed)
+        self.job.log("[rate] %s: %s hits over %d s of data = %.1f Hz average "
+                     "(%d bins)" % (os.path.basename(self.path),
+                                    format(hits, ","), span,
+                                    hits / float(max(span, 1)), len(self.closed)))
+        if self.late:
+            self.job.log("[rate] note: %d message(s) arrived after their bin had "
+                         "closed and were counted in the next bin" % self.late)
+
+    def _publish(self, running):
+        current = None
+        if self.next_bin in self.bins:
+            h, m = self.bins[self.next_bin]
+            current = {"bin_start_s": self.next_bin * RATE_BIN_S,
+                       "hits": h, "messages": m}
+        with LIVE_RATE_LOCK:
+            LIVE_RATE.clear()
+            LIVE_RATE.update({
+                "file": os.path.basename(self.path) if self.path else None,
+                "running": running, "bin_s": RATE_BIN_S,
+                "anchor": self.anchor, "bins": list(self.closed[-720:]),
+                "current": current, "parsed_msgs": self.last,
+                "late": self.late, "updated": time.time(),
+                "descriptor": CTX.descriptor})
 
 
 class DensityError(Exception):
@@ -2060,7 +2303,7 @@ def evd_live_hits(exclude=None):
     if fmt is None:
         return None
     rhdf5, pmf = fmt
-    latest, _ = get_latest_file("*raw*.h5", directory=".")
+    latest = latest_live_raw()
     if latest is None:
         return None
     path = str(latest)
@@ -2736,6 +2979,72 @@ RUNDB = RunDB()
 # ---------------------------------------------------------------------------
 # Operation handlers (one per pipeline step, argvs preserved verbatim)
 # ---------------------------------------------------------------------------
+def find_fallback_hydra():
+    """Hydra networks belonging to OTHER descriptors, newest first.
+
+    Looks in ``runs/*/hydra_files/`` (this GUI) and ``*/hydra_files/`` (the
+    text menu's old top-level descriptor folders), both relative to the launch
+    directory. Used only when the active descriptor has none of its own.
+    """
+    own = (os.path.abspath(CTX.d("hydra_files")) if CTX.is_ready() else None)
+    found = {}
+    for pattern in (os.path.join(RUNS_PARENT, "*", "hydra_files", "*.json"),
+                    os.path.join("*", "hydra_files", "*.json")):
+        for f in glob.glob(pattern):
+            full = os.path.abspath(f)
+            if os.path.dirname(full) == own or not os.path.isfile(full):
+                continue
+            found[str(Path(full).resolve())] = os.path.getmtime(full)
+    return sorted(found, key=found.get, reverse=True)
+
+
+def _hydra_owner(path):
+    """Descriptor a hydra file belongs to: .../<descriptor>/hydra_files/<file>."""
+    return os.path.basename(os.path.dirname(os.path.dirname(path)))
+
+
+def resolve_hydra(job, p):
+    """The hydra network for this step, falling back to another descriptor's.
+
+    A file already in this descriptor's hydra_files/ is returned untouched (the
+    preserved behaviour). One from another descriptor -- the dropdown offers
+    those only when this descriptor has none -- is COPIED in first, so the
+    descriptor records which network it ran with, later steps find it as its
+    own, and the path keeps the usual runs/<descriptor>/hydra_files/ shape the
+    pipeline scripts parse the tile id from. Returns None (and logs why) if
+    there is nothing usable.
+    """
+    own_dir = os.path.abspath(CTX.d("hydra_files"))
+    chosen = (p.get("hydra_file") or "").strip()
+    if not chosen:
+        own = _files("hydra_files", "json")
+        fallback = [] if own else find_fallback_hydra()
+        chosen = own[-1] if own else (fallback[0] if fallback else "")
+    if not chosen:
+        job.log("[ERROR] No hydra network in this descriptor or any other under "
+                "%s/ -- run step 2 (Make hydra network) first." % RUNS_PARENT)
+        job.had_error = True
+        return None
+    if not (os.path.isfile(chosen) and chosen.endswith(".json")):
+        job.log("[ERROR] Hydra network file not found: %s" % chosen)
+        job.had_error = True
+        return None
+    if os.path.dirname(os.path.abspath(chosen)) == own_dir:
+        return chosen
+    src_desc = _hydra_owner(os.path.abspath(chosen))
+    dest = os.path.join(own_dir, os.path.basename(chosen))
+    if os.path.exists(dest) and not filecmp.cmp(chosen, dest, shallow=False):
+        stem, ext = os.path.splitext(os.path.basename(chosen))
+        dest = os.path.join(own_dir, "%s_from_%s%s" % (stem, src_desc, ext))
+    if not os.path.exists(dest):
+        shutil.copy2(chosen, dest)
+    dest = str(Path(dest).resolve())
+    job.log("[hydra] No hydra network in '%s' -- using %s from descriptor '%s' "
+            "(copied to %s)" % (CTX.descriptor, os.path.basename(chosen),
+                                src_desc, dest))
+    return dest
+
+
 def op_check_power(job, p):
     command = ["python3", "check_power.py",
                "--pacman_tile", str(PACMAN_TILE), "--io_group", str(IO_GROUP)]
@@ -2753,7 +3062,9 @@ def op_make_hydra(job, p):
 
 
 def op_plot_hydra(job, p):
-    hydra = p["hydra_file"]
+    hydra = resolve_hydra(job, p)
+    if hydra is None:
+        return
     command = ["python3", "plot_hydra_network_v2a.py",
                "--controller_config", hydra,
                "--geometry_yaml", GEOMETRY_YAML, "--io_group", str(IO_GROUP)]
@@ -2766,7 +3077,9 @@ def op_plot_hydra(job, p):
 
 
 def op_trigger_rate(job, p):
-    hydra = p["hydra_file"]
+    hydra = resolve_hydra(job, p)
+    if hydra is None:
+        return
     command = ["python3", "multi_trigger_rate_qc.py", "--controller_config", hydra]
     if CTX.cryo_flag:
         command.append("--cryo")
@@ -2777,7 +3090,9 @@ def op_trigger_rate(job, p):
 
 
 def op_pedestal(job, p):
-    hydra = p["hydra_file"]
+    hydra = resolve_hydra(job, p)
+    if hydra is None:
+        return
     trig = p["trigger_rate_file"]
     runtime = int(p["runtime"])
     command = ["python3", "pedestal_qc.py",
@@ -2806,7 +3121,9 @@ def op_plot_disabled(job, p):
 
 
 def op_find_thresholds(job, p):
-    hydra = p["hydra_file"]
+    hydra = resolve_hydra(job, p)
+    if hydra is None:
+        return
     ped_disabled = p["pedestal_disabled_file"]
     ped_run = p["pedestal_run_file"]
     command = ["python3", "threshold_qc.py",
@@ -2832,7 +3149,9 @@ def op_find_thresholds(job, p):
 
 
 def op_self_trigger(job, p):
-    hydra = p["hydra_file"]
+    hydra = resolve_hydra(job, p)
+    if hydra is None:
+        return
     folder = p["asic_config_folder"]
     runtime = int(p["runtime"])
     repeat = bool(p.get("repeat"))
@@ -2844,9 +3163,15 @@ def op_self_trigger(job, p):
         with open(DG_HEARTBEAT_FILE, "w") as fh:
             fh.write("True")
         start = time.time()
-        run_streamed(job, command)
+        # Tail the file this run writes and log hits per 5 s as it goes; stop
+        # (final drain) after the process exits but BEFORE the file is moved.
+        sampler = RateSampler(job, start).start()
+        try:
+            run_streamed(job, command)
+        finally:
+            sampler.stop()
         dest = move_file(job, "*raw*.h5", CTX.d("raw_self_trigger"), start,
-                         add_ts=False)
+                         add_ts=False, exclude=LIVE_RAW_EXCLUDE)
         if dest:
             try:
                 record_self_trigger(dest, runtime)
@@ -2896,6 +3221,8 @@ def _convert_one(job, raw_path, conv_path):
 def op_convert(job, p):
     raw_dir = CTX.d("raw_self_trigger")
     conv_dir = CTX.d("converted_self_trigger")
+    with job.lock:                 # lets the monitor tell a watch job apart
+        job.extra["mode"] = "single" if p.get("mode") == "single" else "all"
     if p.get("mode") == "single":
         raw_path = p["raw_file"]
         conv_path = os.path.join(conv_dir, "converted_" + os.path.basename(raw_path))
@@ -2930,6 +3257,84 @@ def op_convert(job, p):
             break
 
 
+# Plot files other steps leave in CWD -- never swept up by step 11's collector
+# when they happen to run at the same time.
+OTHER_STEP_PLOTS = ("*hydra*.png", "disabled-xy-map-tile-id*.png")
+MONITOR_PLOT_EXTS = (".png", ".pdf", ".svg", ".html")
+MAX_JOB_PLOTS = 40
+
+
+def _merge_move(src, dst):
+    """Move ``src`` to ``dst``; a re-run merges into an existing folder."""
+    if os.path.isdir(src) and os.path.isdir(dst):
+        for name in os.listdir(src):
+            _merge_move(os.path.join(src, name), os.path.join(dst, name))
+        os.rmdir(src)
+        return
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    elif os.path.exists(dst):
+        os.remove(dst)
+    shutil.move(src, dst)
+
+
+def collect_monitor_plots(job, chosen, dest_dir, since_time):
+    """Move step 11's (larpix-monitor) output out of CWD into ``dest_dir``.
+
+    Upstream run_monitor.py writes ``./<stem>_dqm/<stem>_<Plot>.png``. Taken:
+    that folder, any new entry named after the input file, and any other new
+    plot file in CWD (in case this machine's copy saves flat files) unless it
+    matches another step's output. Never .h5/.json/.txt -- that keeps the live
+    raw file, run_monitor's own temp '<stem>.dqm.h5', ASIC configs and the
+    heartbeat file where they are.
+    """
+    stem = os.path.splitext(os.path.basename(chosen))[0]
+    picked = []
+    for name in sorted(os.listdir(".")):
+        if name.endswith((".h5", ".json", ".txt")):
+            continue
+        try:
+            fresh = os.path.getmtime(name) >= since_time - 1
+        except OSError:
+            continue
+        if name == stem + "_dqm" and os.path.isdir(name):
+            picked.append(name)
+        elif fresh and name.startswith(stem):
+            picked.append(name)
+        elif (fresh and os.path.isfile(name)
+              and name.lower().endswith(MONITOR_PLOT_EXTS)
+              and not any(fnmatch.fnmatch(name, pat) for pat in OTHER_STEP_PLOTS)):
+            picked.append(name)
+    if not picked:
+        job.log("No plot output found in %s to move." % os.getcwd())
+        return []
+    os.makedirs(dest_dir, exist_ok=True)
+    moved = []
+    for name in picked:
+        dest = os.path.join(dest_dir, name)
+        try:
+            _merge_move(name, dest)
+        except OSError as exc:
+            job.log("[WARN] could not move %s: %s" % (name, exc))
+            continue
+        moved.append(dest)
+        job.log("Moved plot output to: %s" % dest)
+    pngs = []
+    for dest in moved:
+        if os.path.isdir(dest):
+            for root, _, files in os.walk(dest):
+                pngs += [os.path.join(root, f) for f in sorted(files)
+                         if f.lower().endswith(".png")]
+        elif dest.lower().endswith(".png"):
+            pngs.append(dest)
+    for png in pngs[:MAX_JOB_PLOTS]:
+        job.add_plot(png)
+    if len(pngs) > MAX_JOB_PLOTS:
+        job.log("(%d more plot(s) in %s not shown here)"
+                % (len(pngs) - MAX_JOB_PLOTS, dest_dir))
+    return moved
+
+
 def op_plot_metrics(job, p):
     file_type = p["file_type"]   # 'p' or 's'
     src_dir = CTX.d("raw_self_trigger") if file_type == "s" else CTX.d("pedestal_runs")
@@ -2945,7 +3350,11 @@ def op_plot_metrics(job, p):
         job.log("Chosen file does not exist: %s" % chosen)
         return
     command = ["python3", "./larpix-monitor/run_monitor.py", "--once", chosen]
+    start = time.time()
     run_streamed(job, command)
+    # run_monitor.py saves into CWD (its -o defaults to './'); the argv stays
+    # as-is and the plots are moved next to the data they describe instead.
+    collect_monitor_plots(job, chosen, os.path.join(src_dir, "plots"), start)
 
 
 def op_clustering(job, p):
@@ -2979,6 +3388,8 @@ def op_clustering(job, p):
                 job.log("[WARN] metric record failed: %s" % exc)
 
     mode = p.get("mode", "single")
+    with job.lock:                 # lets the monitor tell a watch job apart
+        job.extra["mode"] = mode
     if mode == "single":
         cluster_one(p["converted_file"])
     elif mode == "multiple":
@@ -3804,6 +4215,283 @@ ACTION_LABELS = {
 
 
 # ---------------------------------------------------------------------------
+# Live monitor page (/monitor): one summary poll + a cluster-charge spectrum.
+# Everything else the page shows comes from the existing pixel-map, event-
+# display and lifetime endpoints.
+# ---------------------------------------------------------------------------
+MON_CACHE_LOCK = threading.Lock()
+MON_SUMMARY_LOCK = threading.Lock()   # one summary build at a time (no stampede)
+MON_SPECTRUM_LOCK = threading.Lock()
+MON_RATE_CACHE = {}      # (abspath, stage) -> (mtime, size, row)
+MON_SPEC_CACHE = {}      # (abspath, params) -> (mtime, size, (hist, n, under, over))
+MON_CSV_CACHE = {}       # csv path -> (mtime, size, rows)
+MON_MAX_FILES = 300      # newest files reported per stage
+MON_MAX_5S_ROWS = 3000   # newest 5 s bins returned
+
+
+def _running_jobs():
+    with JOBS.lock:
+        jobs = list(JOBS.jobs.values())
+    return [j for j in jobs if j.status == "running"]
+
+
+def _h5_names(dir_key):
+    """.h5 basenames in one run subdir, oldest first (names carry the timestamp)."""
+    try:
+        return sorted(f for f in os.listdir(CTX.d(dir_key)) if f.endswith(".h5"))
+    except OSError:
+        return []
+
+
+def _file_start_iso(name, path=None):
+    """Run start from the filename timestamp, else the file's mtime."""
+    m = RunDB.TS_RE.search(name)
+    if m:
+        try:
+            return datetime(*map(int, m.groups())).isoformat(timespec="seconds")
+        except ValueError:
+            pass
+    if path:
+        try:
+            return datetime.fromtimestamp(
+                os.path.getmtime(path)).isoformat(timespec="seconds")
+        except OSError:
+            pass
+    return None
+
+
+def _cached_csv(path):
+    """Rows of a metrics CSV, re-read only when the file changes."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    with MON_CACHE_LOCK:
+        hit = MON_CSV_CACHE.get(path)
+        if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+            return hit[2]
+    with METRICS_LOCK:
+        with open(path, newline="") as fh:
+            rows = list(csv.DictReader(fh))
+    with MON_CACHE_LOCK:
+        MON_CSV_CACHE[path] = (st.st_mtime, st.st_size, rows)
+    return rows
+
+
+def _file_data_rate(path, stage):
+    """Data rate of one converted/clustered file per second of detector time.
+
+    convert: data packets (packet_type 0) / seconds; clustering: clusters /
+    seconds. Seconds come from the data itself (span of the converted file's
+    PACMAN timestamp packets, type 4, one per message), then the run DB's
+    runtime, then -- clustered only -- the clusters' own unix span. A clustered
+    file uses its converted parent's seconds so both panels share a clock.
+    Cached on (mtime, size); None if the file can't be read yet (mid-write).
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (os.path.abspath(path), stage)
+    with MON_CACHE_LOCK:
+        hit = MON_RATE_CACHE.get(key)
+        if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+            return hit[2]
+    name = os.path.basename(path)
+    count, span = None, None
+    try:
+        with open_h5_read(path) as f:
+            if stage == "convert":
+                pk = f["packets"]
+                ptype = pk["packet_type"]
+                count = int((ptype == 0).sum())
+                ts = pk["timestamp"][ptype == 4]
+                ts = ts[ts > 0]
+                if ts.size:
+                    span = float(ts.max() - ts.min() + 1)
+            else:
+                cl = f["clusters"]
+                count = int(cl.shape[0])
+                if count:
+                    u = cl["unix"]
+                    u = u[u > 0]
+                    if u.size:
+                        span = float(u.max() - u.min() + 1)
+    except Exception:
+        return None
+    seconds, source = None, None
+    if stage == "convert" and span:
+        seconds, source = span, "timestamp packets"
+    if seconds is None and stage == "clustering":
+        conv = name[len("clustered_"):] if name.startswith("clustered_") else name
+        parent = _file_data_rate(os.path.join(CTX.d("converted_self_trigger"),
+                                              conv), "convert")
+        if parent and parent.get("seconds"):
+            seconds, source = parent["seconds"], "converted file"
+    if seconds is None:
+        conv = name[len("clustered_"):] if name.startswith("clustered_") else name
+        try:
+            runtime = RUNDB.runtime_for_converted(conv)
+        except Exception:
+            runtime = None
+        if runtime:
+            seconds, source = float(runtime), "run DB runtime"
+    if seconds is None and span:
+        seconds, source = span, "cluster time span"
+    row = {"file": name, "t": _file_start_iso(name, path), "count": count,
+           "seconds": seconds, "seconds_source": source,
+           "rate": round(count / seconds, 3) if (count is not None and seconds)
+           else None}
+    with MON_CACHE_LOCK:
+        MON_RATE_CACHE[key] = (st.st_mtime, st.st_size, row)
+    return row
+
+
+def _rate_history(minutes):
+    """Closed 5 s bins from metrics/self_trigger_5s.csv in the last N minutes."""
+    rows = _cached_csv(os.path.join(CTX.d("metrics"), "self_trigger_5s.csv"))
+    cutoff = datetime.fromtimestamp(time.time() - minutes * 60).isoformat(
+        timespec="seconds")
+    out = []
+    for r in rows:
+        if (r.get("wall_time") or "") < cutoff:   # ISO strings sort by time
+            continue
+        try:
+            out.append({"t": r["wall_time"], "file": r.get("file"),
+                        "bin_start_s": int(float(r.get("bin_start_s") or 0)),
+                        "hits": int(float(r.get("hits") or 0)),
+                        "rate": float(r.get("hits_per_s") or 0),
+                        "partial": r.get("partial") in ("1", "True", "true")})
+        except (TypeError, ValueError):
+            continue
+    return out[-MON_MAX_5S_ROWS:]
+
+
+def monitor_summary(minutes=60):
+    """Everything the monitor's KPI strip and rate panels need, in one poll."""
+    running = _running_jobs()
+
+    def is_running(action, mode=None):
+        return any(j.action == action and
+                   (mode is None or j.extra.get("mode") == mode) for j in running)
+
+    out = {"descriptor": CTX.descriptor, "now": time.time(),
+           "running": {"self_trigger": is_running("self_trigger"),
+                       "convert": is_running("convert"),
+                       "convert_watch": is_running("convert", "all"),
+                       "clustering": is_running("clustering"),
+                       "clustering_watch": is_running("clustering", "all"),
+                       "lifetime": is_running("lifetime")},
+           "last_status": {a: s for a, s in
+                           JOBS.latest_status_by_action().items()
+                           if a in ("lifetime", "convert", "clustering")}}
+    with LIVE_RATE_LOCK:
+        live = dict(LIVE_RATE)
+    out["live"] = live if live.get("descriptor") == CTX.descriptor else None
+    if not CTX.is_ready():
+        return out
+    with MON_SUMMARY_LOCK:
+        raw = _h5_names("raw_self_trigger")
+        conv = _h5_names("converted_self_trigger")
+        clus = _h5_names("clustered_data")
+        conv_set, clus_set = set(conv), set(clus)
+        need_conv = [r for r in raw if "converted_" + r not in conv_set]
+        need_clus = [c for c in conv if "clustered_" + c not in clus_set]
+        out["files"] = {"raw": len(raw), "converted": len(conv),
+                        "clustered": len(clus),
+                        "backlog_convert": len(need_conv),
+                        "backlog_cluster": len(need_clus),
+                        "newest_raw": raw[-1] if raw else None,
+                        "newest_converted": conv[-1] if conv else None,
+                        "newest_clustered": clus[-1] if clus else None,
+                        # rows appear only once a conversion has FINISHED, so
+                        # a rise is the monitor's "safe to update lifetime" cue
+                        "convert_records": len(_cached_csv(
+                            _metrics_csv("convert")))}
+        out["history_5s"] = _rate_history(minutes)
+        out["self_trigger_files"] = [
+            {"t": r.get("timestamp"), "file": r.get("file"),
+             "rate": float(r["messages_per_s"])}
+            for r in _cached_csv(_metrics_csv("self_trigger"))
+            if r.get("messages_per_s") not in (None, "")][-MON_MAX_FILES:]
+        for stage, key, names in (("convert", "converted_self_trigger", conv),
+                                  ("clustering", "clustered_data", clus)):
+            rows = []
+            for name in names[-MON_MAX_FILES:]:
+                row = _file_data_rate(os.path.join(CTX.d(key), name), stage)
+                if row is not None:
+                    rows.append(row)
+            out[stage] = rows
+    return out
+
+
+def _file_charge_hist(path, edges, q_to_ke, min_nhit):
+    """(hist, n_clusters, underflow, overflow) of one clustered file's q (ke-)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (os.path.abspath(path), len(edges), float(edges[0]), float(edges[-1]),
+           q_to_ke, min_nhit)
+    with MON_CACHE_LOCK:
+        hit = MON_SPEC_CACHE.get(key)
+        if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+            return hit[2]
+    try:
+        with open_h5_read(path) as f:
+            cl = f["clusters"]
+            q = np.asarray(cl["q"], dtype="f8") * q_to_ke
+            if min_nhit > 1:
+                q = q[np.asarray(cl["nhit"]) >= min_nhit]
+    except Exception:
+        return None
+    hist, _ = np.histogram(q, bins=edges)
+    res = (hist, int(q.size), int((q < edges[0]).sum()),
+           int((q >= edges[-1]).sum()))
+    with MON_CACHE_LOCK:
+        MON_SPEC_CACHE[key] = (st.st_mtime, st.st_size, res)
+    return res
+
+
+def cluster_spectrum(max_ke=100.0, bins=100, min_nhit=1, min_ke=0.0):
+    """Cluster charge spectrum over the run's clustered files + the newest one.
+
+    q is pedestal-subtracted, so clusters can be negative; ``min_ke`` < 0 shows
+    them and ``underflow`` counts whatever falls below the range.
+    """
+    if np is None or h5py is None:
+        return {"error": "numpy/h5py not available"}
+    if not CTX.is_ready():
+        return {"error": "set a descriptor first"}
+    if min_ke >= max_ke:
+        return {"error": "min must be below max"}
+    q_to_ke = THRESH_DEFAULTS["q_to_ke"]
+    edges = np.linspace(min_ke, max_ke, bins + 1)
+    total = np.zeros(bins, dtype=np.int64)
+    latest = latest_name = None
+    n_files = n_clusters = under = over = 0
+    with MON_SPECTRUM_LOCK:
+        for name in _h5_names("clustered_data"):
+            res = _file_charge_hist(os.path.join(CTX.d("clustered_data"), name),
+                                    edges, q_to_ke, min_nhit)
+            if res is None:
+                continue
+            total += res[0]
+            n_clusters += res[1]
+            under += res[2]
+            over += res[3]
+            n_files += 1
+            latest, latest_name = res, name
+    return {"edges": np.round(edges, 4).tolist(), "all": total.tolist(),
+            "latest": latest[0].tolist() if latest else None,
+            "latest_file": latest_name,
+            "latest_n": latest[1] if latest else 0,
+            "n_files": n_files, "n_clusters": n_clusters,
+            "underflow": under, "overflow": over, "q_to_ke": q_to_ke,
+            "min_nhit": min_nhit}
+
+
+# ---------------------------------------------------------------------------
 # State for the dropdowns
 # ---------------------------------------------------------------------------
 def _files(key, ext):
@@ -3836,8 +4524,13 @@ def build_state():
             asic_folders = get_dirs_by_creation(CTX.d("asic_configs"))
         except Exception:
             asic_folders = []
+        hydra = _files("hydra_files", "json")
+        hydra_fallback = not hydra
+        if hydra_fallback:              # offer older networks, newest first
+            hydra = find_fallback_hydra()
         state["files"] = {
-            "hydra": _files("hydra_files", "json"),
+            "hydra": hydra,
+            "hydra_fallback": hydra_fallback and bool(hydra),
             "trigger_rate": _files("trigger_rate_disabled", "json"),
             "pedestal_second": _files("pedestal_second", "json"),
             "pedestal_runs": _files("pedestal_runs", "h5"),
@@ -3958,6 +4651,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_file(os.path.join(ASSETS_DIR, "lifetime.html"))
         if path == "/eventdisplay":
             return self._send_file(os.path.join(ASSETS_DIR, "eventdisplay.html"))
+        if path == "/monitor":
+            return self._send_file(os.path.join(ASSETS_DIR, "monitor.html"))
         if path.startswith("/assets/"):
             name = os.path.basename(path)
             return self._send_file(os.path.join(ASSETS_DIR, name))
@@ -4071,6 +4766,24 @@ class Handler(BaseHTTPRequestHandler):
                 qs.get("path", [""])[0].strip(),
                 qs.get("kind", ["clustered"])[0], threshold_params(qs),
                 chip, ch))
+        if path == "/api/monitor/summary":
+            try:
+                minutes = min(max(float(qs.get("minutes", ["60"])[0]), 1.0),
+                              24 * 60.0)
+            except ValueError:
+                minutes = 60.0
+            return self._send_json(monitor_summary(minutes))
+        if path == "/api/monitor/spectrum":
+            try:
+                max_ke = min(max(float(qs.get("max_ke", ["100"])[0]), -1e5), 1e5)
+                min_ke = min(max(float(qs.get("min_ke", ["0"])[0]), -1e5), 1e5)
+                bins = min(max(int(qs.get("bins", ["100"])[0]), 5), 1000)
+                min_nhit = max(int(qs.get("min_nhit", ["1"])[0]), 1)
+            except ValueError:
+                return self._send_json(
+                    {"error": "bad min_ke/max_ke/bins/min_nhit"}, 400)
+            out = cluster_spectrum(max_ke, bins, min_nhit, min_ke)
+            return self._send_json(out, 400 if "error" in out else 200)
         if path == "/api/evd/sources":
             return self._send_json(evd_sources())
         if path in ("/api/evd/events", "/api/evd/event"):

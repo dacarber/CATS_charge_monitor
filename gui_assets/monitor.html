@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live monitor</title>
+  <script>(function(){var t=localStorage.getItem("larpix-theme")||"dark";document.documentElement.setAttribute("data-theme",t);})();</script>
+  <link rel="stylesheet" href="/assets/style.css">
+  <style>
+    .monwrap { max-width: 1500px; margin: 0 auto; padding: 14px 20px 30px; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 10px; }
+    .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+    .kpi .v { font-size: 22px; font-weight: 700; color: var(--accent); white-space: nowrap; }
+    .kpi .l { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .kpi .s { font-size: 11px; color: var(--muted); margin-top: 2px; overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; }
+    .kpi.ok   { border-color: var(--ok); }   .kpi.ok .v   { color: var(--ok); }
+    .kpi.warn { border-color: var(--warn); } .kpi.warn .v { color: var(--warn); }
+    .kpi.bad  { border-color: var(--err); }  .kpi.bad .v  { color: var(--err); }
+    .banner { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px;
+              padding: 8px 12px; border-radius: 8px; font-size: 13px;
+              background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+    .banner button { padding: 4px 10px; font-size: 12px; }
+    .mongrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+    .mongrid .wide { grid-column: 1 / -1; }
+    @media (max-width: 900px) { .mongrid { grid-template-columns: 1fr; } }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+             padding: 10px 12px; min-width: 0; }
+    .phead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+    .phead h3 { margin: 0; font-size: 14px; }
+    .phead .sub { font-size: 12px; color: var(--muted); }
+    .phead .ctl { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+                  font-size: 12px; color: var(--muted); }
+    .phead .ctl label { display: inline-flex; gap: 4px; align-items: center; }
+    .phead .ctl input[type=number] { width: 70px; padding: 3px 6px; }
+    .phead .ctl select { padding: 3px 6px; width: auto; }
+    .phead .ctl button { padding: 3px 10px; font-size: 12px; }
+    .plot { min-height: 230px; }
+    .plot svg { display: block; }
+    .empty { color: var(--muted); padding: 40px 10px; text-align: center; font-size: 13px; }
+    .legend-row { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .legend-row span { display: inline-flex; gap: 5px; align-items: center; }
+    .legend-row i { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+    #evd-canvas { display: block; width: 100%; height: auto; background: var(--bg);
+                  border: 1px solid var(--border); border-radius: 8px; }
+    .scale { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); margin-top: 6px; }
+    .scale .bar { flex: 1; height: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>
+      <a class="linkbtn" href="/">&larr; Flow</a>
+      Live monitor
+      <span class="livebadge" id="run-badge">loading…</span>
+      <span id="theme-slot" style="margin-left:auto"></span>
+    </h1>
+    <div class="descbar">
+      <div class="status" id="desc-status"></div>
+      <div class="dashlinks" style="margin-top:0">
+        <a href="/dashboard?stage=self_trigger">Self-trigger</a>
+        <a href="/dashboard?stage=convert">Conversion</a>
+        <a href="/dashboard?stage=clustering">Clustering</a>
+        <a href="/pixelmap">Pixel map</a>
+        <a href="/rundb">Run database</a>
+        <a href="/lifetime">Lifetime</a>
+        <a href="/eventdisplay">Event display</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="monwrap">
+    <div class="kpis" id="kpis"></div>
+    <div class="banner" id="pipe-banner" style="display:none"></div>
+
+    <div class="mongrid">
+      <div class="panel wide">
+        <div class="phead">
+          <h3>Self-trigger rate</h3>
+          <span class="sub" id="rate-sub">hits / s in 5 s bins</span>
+          <div class="ctl">
+            <label>Window
+              <select id="rate-window">
+                <option value="15">15 min</option>
+                <option value="60" selected>1 h</option>
+                <option value="240">4 h</option>
+                <option value="1440">24 h</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="plot" id="rate-plot"></div>
+        <div class="legend-row" id="rate-legend"></div>
+      </div>
+
+      <div class="panel">
+        <div class="phead">
+          <h3>Conversion data rate</h3>
+          <span class="sub">data packets / s of run time, per file</span>
+        </div>
+        <div class="plot" id="conv-plot"></div>
+      </div>
+
+      <div class="panel">
+        <div class="phead">
+          <h3>Clustering rate</h3>
+          <span class="sub">clusters / s of run time, per file</span>
+        </div>
+        <div class="plot" id="clu-plot"></div>
+      </div>
+
+      <div class="panel">
+        <div class="phead">
+          <h3>Pixel map</h3>
+          <span class="sub" id="pix-sub"></span>
+        </div>
+        <div class="plot" id="pix-plot"></div>
+        <div class="scale"><span id="pix-min">0</span><div class="bar" id="pix-bar"></div><span id="pix-max">-</span><span>hits (log)</span></div>
+      </div>
+
+      <div class="panel">
+        <div class="phead">
+          <h3>Event display</h3>
+          <span class="sub" id="evd-sub"></span>
+          <div class="ctl">
+            <label>Min hits <input type="number" id="evd-minhits" value="20" min="1"></label>
+          </div>
+        </div>
+        <canvas id="evd-canvas" width="900" height="420"></canvas>
+        <div class="scale"><span>low q</span><div class="bar" id="evd-bar"></div><span>high q</span></div>
+      </div>
+
+      <div class="panel">
+        <div class="phead">
+          <h3>Electron lifetime</h3>
+          <span class="sub" id="lt-sub"></span>
+          <div class="ctl">
+            <label title="Recompute whenever new converted files appear (and no lifetime job is running)">
+              <input type="checkbox" id="lt-auto"> Auto-update</label>
+            <button class="secondary" id="lt-update">Update now</button>
+          </div>
+        </div>
+        <div class="plot" id="lt-plot"></div>
+      </div>
+
+      <div class="panel">
+        <div class="phead">
+          <h3>Cluster charge spectrum</h3>
+          <span class="sub" id="spec-sub"></span>
+          <div class="ctl">
+            <label>Min <input type="number" id="spec-min" value="0" step="10"></label>
+            <label>Max <input type="number" id="spec-max" value="100" step="10"> ke⁻</label>
+            <label>Min hits <input type="number" id="spec-minhit" value="1" min="1"></label>
+            <label><input type="checkbox" id="spec-log" checked> log y</label>
+          </div>
+        </div>
+        <div class="plot" id="spec-plot"></div>
+        <div class="legend-row" id="spec-legend"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/assets/common.js"></script>
+  <script src="/assets/monitor.js"></script>
+</body>
+</html>

@@ -86,7 +86,7 @@ async function withBusy(btn, busyText, fn) {
   }
 }
 
-function fillSelect(sel, items, keepValue = true) {
+function fillSelect(sel, items, keepValue = true, labelFn = basename) {
   if (!sel) return;
   items = items || [];
   // Pages refresh every few seconds: leave an unchanged list alone so the
@@ -99,7 +99,7 @@ function fillSelect(sel, items, keepValue = true) {
   sel.innerHTML = "";
   items.forEach((p) => {
     const o = document.createElement("option");
-    o.value = p; o.textContent = basename(p);
+    o.value = p; o.textContent = labelFn(p);
     if (keepValue && prev.has(p)) o.selected = true;
     sel.appendChild(o);
   });

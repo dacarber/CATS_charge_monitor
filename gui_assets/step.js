@@ -53,10 +53,34 @@ function updatePmFileSelect() {
   fillSelect($("sel-file-pm"), type === "s" ? STATE.files.raw : STATE.files.pedestal_runs);
 }
 
+// ".../<descriptor>/hydra_files/<file>" -> "<descriptor> › <file>"
+function hydraOwnerLabel(p) {
+  const parts = p.split(/[\\/]/);
+  return (parts[parts.length - 3] || "?") + " › " + parts[parts.length - 1];
+}
+
+// When this descriptor has no hydra network the server offers other
+// descriptors' networks (newest first); say so under each hydra dropdown.
+function syncHydraHint(sel, fallback) {
+  let hint = sel.nextElementSibling;
+  if (!hint || !hint.classList.contains("hydra-hint")) {
+    hint = document.createElement("div");
+    hint.className = "hint hydra-hint";
+    sel.after(hint);
+  }
+  hint.style.display = fallback ? "" : "none";
+  hint.textContent = "No hydra network for this descriptor — using the most " +
+    "recent one from another descriptor. It will be copied into this descriptor when the step runs.";
+}
+
 function populateSelects() {
   if (!STATE || !STATE.files) return;
+  const hydraFallback = !!STATE.files.hydra_fallback;
   document.querySelectorAll("select[data-files]").forEach((sel) => {
-    fillSelect(sel, STATE.files[sel.dataset.files] || []);
+    const isHydra = sel.dataset.files === "hydra";
+    fillSelect(sel, STATE.files[sel.dataset.files] || [], true,
+               isHydra && hydraFallback ? hydraOwnerLabel : basename);
+    if (isHydra) syncHydraHint(sel, hydraFallback);
   });
   if (STEP === "plot_metrics") updatePmFileSelect();
 }
